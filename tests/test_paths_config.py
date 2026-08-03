@@ -200,8 +200,10 @@ def test_descriptor_mode_change_is_not_applied_to_windows_acl_metadata(
     descriptor = os.open(private_file, os.O_RDWR | os.O_CREAT, 0o600)
     monkeypatch.setattr("tether_agent.secure_files.os.name", "nt")
     monkeypatch.setattr(
-        "tether_agent.secure_files.os.fchmod",
+        os,
+        "fchmod",
         lambda *_: pytest.fail("Windows ACL metadata must not use fchmod"),
+        raising=False,
     )
     try:
         secure_descriptor(descriptor, private_file)

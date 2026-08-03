@@ -52,7 +52,12 @@ def validate_private_file(path: Path, *, allow_missing: bool = True) -> None:
         raise PermissionError(f"Private path is not a regular file: {path}")
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
         raise PermissionError(f"Private file is not owned by the current user: {path}")
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
+    # Windows exposes synthesized POSIX mode bits that do not represent the
+    # file's ACL. Applying the Unix 0600 test there rejects files created by
+    # this process even after chmod. Symlink and regular-file validation still
+    # apply on Windows; ownership and mode enforcement apply where the OS
+    # exposes real Unix ownership and permission semantics.
+    if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
         raise PermissionError(f"Private file permissions must be 0600: {path}")
 
 

@@ -17,6 +17,7 @@ from tether_agent.config import (
     write_profile_config,
 )
 from tether_agent.paths import ProfilePaths
+from tether_agent.secure_files import validate_private_file
 from tether_agent.state import StateStore
 
 
@@ -157,6 +158,7 @@ def test_mutation_rejects_process_or_dotenv_shadowing(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX mode bits")
 def test_private_files_reject_unsafe_permissions_and_symlinks(tmp_path: Path) -> None:
     insecure = tmp_path / "insecure.sqlite3"
     insecure.touch(mode=0o644)
@@ -175,3 +177,15 @@ def test_private_files_reject_unsafe_permissions_and_symlinks(tmp_path: Path) ->
     dangling.symlink_to(tmp_path / "missing-target.sqlite3")
     with pytest.raises(PermissionError, match="symlinked"):
         StateStore(dangling)
+
+
+def test_private_file_mode_check_is_not_applied_to_windows_acl_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_file = tmp_path / "state.sqlite3"
+    private_file.touch(mode=0o644)
+    os.chmod(private_file, 0o644)
+    monkeypatch.setattr("tether_agent.secure_files.os.name", "nt")
+
+    validate_private_file(private_file, allow_missing=False)

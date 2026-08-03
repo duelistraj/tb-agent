@@ -1,7 +1,7 @@
 import json
 import logging
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 import pytest
@@ -394,7 +394,7 @@ def test_service_definitions_contain_only_profile_executable_and_service_metadat
         config_dir=tmp_path / "private/repository/path",
         state_dir=tmp_path / "private/state/path",
     )
-    executable = Path("/opt/tether/bin/tb-agent")
+    executable = PurePosixPath("/opt/tether/bin/tb-agent")
     linux = _systemd_definition(paths, executable).decode()
     mac = _launchd_definition(paths, executable).decode()
 
@@ -468,7 +468,7 @@ def test_systemd_service_install_is_optional_and_contains_no_profile_state(
     monkeypatch.setattr("tether_agent.services._systemd_path", lambda paths: unit)
     monkeypatch.setattr(
         "tether_agent.services._executable",
-        lambda: Path("/opt/tether/bin/tb-agent"),
+        lambda: PurePosixPath("/opt/tether/bin/tb-agent"),
     )
     monkeypatch.setattr("tether_agent.services.subprocess.run", run)
 

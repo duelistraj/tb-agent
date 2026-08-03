@@ -17,7 +17,7 @@ from tether_agent.config import (
     write_profile_config,
 )
 from tether_agent.paths import ProfilePaths
-from tether_agent.secure_files import validate_private_file
+from tether_agent.secure_files import secure_descriptor, validate_private_file
 from tether_agent.state import StateStore
 
 
@@ -190,3 +190,20 @@ def test_private_file_mode_check_is_not_applied_to_windows_acl_metadata(
     monkeypatch.setattr("tether_agent.secure_files.os.name", "nt")
 
     validate_private_file(private_file, allow_missing=False)
+
+
+def test_descriptor_mode_change_is_not_applied_to_windows_acl_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_file = tmp_path / "state.sqlite3"
+    descriptor = os.open(private_file, os.O_RDWR | os.O_CREAT, 0o600)
+    monkeypatch.setattr("tether_agent.secure_files.os.name", "nt")
+    monkeypatch.setattr(
+        "tether_agent.secure_files.os.fchmod",
+        lambda *_: pytest.fail("Windows ACL metadata must not use fchmod"),
+    )
+    try:
+        secure_descriptor(descriptor, private_file)
+    finally:
+        os.close(descriptor)

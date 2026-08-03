@@ -12,6 +12,11 @@ FILE_MODE = 0o600
 
 
 def secure_descriptor(descriptor: int, path: Path, mode: int = FILE_MODE) -> None:
+    if os.name == "nt":
+        # Windows permissions are ACL-based. Python 3.14 exposes fchmod on
+        # Windows, but applying it to the read-only descriptors used to verify
+        # SQLite sidecars fails with Access Denied and does not secure the ACL.
+        return
     if hasattr(os, "fchmod"):
         os.fchmod(descriptor, mode)
     else:

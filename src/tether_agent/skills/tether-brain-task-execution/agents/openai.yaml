@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tether Brain setup"
+  short_description: "Set up Tether Brain task execution"
+  default_prompt: "Use $tether-brain-task-execution to connect this repository to Tether Brain."

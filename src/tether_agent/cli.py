@@ -1,0 +1,1105 @@
+"""Profile-aware command line interface for the local Tether Agent."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import getpass
+import logging
+import logging.handlers
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from uuid import UUID, uuid4
+
+import httpx
+
+from tether_agent import __version__
+from tether_agent.api import TetherApi
+from tether_agent.codex_skill import install_skill, skill_status, uninstall_skill
+from tether_agent.config import (
+    MUTABLE_ENV_KEYS,
+    DaemonSettings,
+    ProfileConfig,
+    ProjectMapping,
+    assert_mutation_not_shadowed,
+    configured_environment_keys,
+    load_effective_settings,
+    write_profile_config,
+)
+from tether_agent.daemon import AgentDaemon
+from tether_agent.locking import LockUnavailable, ProfileLock
+from tether_agent.oauth import (
+    oauth_login,
+    refresh_credential,
+    validate_installation_credential,
+)
+from tether_agent.paths import DEFAULT_PROFILE, ProfilePaths
+from tether_agent.profile import ProfileManager
+from tether_agent.repositories import (
+    git_remote_identity,
+    inspect_repository,
+    normalize_git_remote,
+)
+from tether_agent.secure_files import (
+    FILE_MODE,
+    ensure_private_directory,
+    validate_private_file,
+)
+from tether_agent.services import ServiceManager
+from tether_agent.state import StateStore
+
+TOKEN_PATTERN = re.compile(r"tb_(?:pat|oat|ort|iat|irt|sat|sac|ssh|wsr)_[A-Za-z0-9_-]+")
+WORKSPACE_ENV_KEYS = frozenset(
+    {
+        "TETHER_AGENT_CONFIG_REVISION",
+        "TETHER_AGENT_PROJECT_MAPPINGS",
+        "TETHER_AGENT_STATE_PATH",
+    }
+)
+AUTH_ENV_KEYS = frozenset(
+    {
+        "TETHER_AGENT_ACCESS_TOKEN",
+        "TETHER_AGENT_CONFIG_REVISION",
+        "TETHER_AGENT_STATE_PATH",
+    }
+)
+CONFIGURATION_ENV_KEYS = MUTABLE_ENV_KEYS
+
+
+class _RedactTokenFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        record.msg = TOKEN_PATTERN.sub("[REDACTED CREDENTIAL]", message)
+        record.args = ()
+        return True
+
+
+# Keep the Phase 1 test and import surface while broadening redaction coverage.
+_RedactPatFilter = _RedactTokenFilter
+
+
+def _configure_logging(paths: ProfilePaths) -> None:
+    ensure_private_directory(paths.state_dir)
+    validate_private_file(paths.log_file)
+    if not paths.log_file.exists():
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(paths.log_file, flags, FILE_MODE)
+        os.close(descriptor)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    stream = logging.StreamHandler()
+    stream.setFormatter(formatter)
+    file_handler = logging.handlers.RotatingFileHandler(
+        paths.log_file,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    paths.log_file.chmod(0o600)
+    file_handler.setFormatter(formatter)
+    redactor = _RedactTokenFilter()
+    stream.addFilter(redactor)
+    file_handler.addFilter(redactor)
+    logging.basicConfig(level=logging.INFO, handlers=[stream, file_handler], force=True)
+
+
+def validate_codex_authentication() -> None:
+    executable = shutil.which("codex")
+    if executable is None:
+        raise RuntimeError("Codex CLI is not installed or is not available on PATH")
+    result = subprocess.run(
+        [executable, "login", "status"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Codex CLI is not authenticated. Run 'codex login' first.")
+
+
+async def _validate_pat(server_url: str, pat: str) -> dict:
+    if not pat.startswith("tb_pat_"):
+        raise RuntimeError("The supplied credential is not a Tether Brain PAT")
+    api = TetherApi(server_url, pat)
+    try:
+        identity = await api.identity()
+    except httpx.HTTPError as error:
+        raise RuntimeError("Tether Brain rejected the supplied PAT") from error
+    finally:
+        await api.close()
+    capabilities = identity.get("capabilities") or {}
+    if not capabilities.get("content_write"):
+        raise RuntimeError(
+            "The daemon requires a PAT with Read and write access. Create or edit "
+            "the PAT in Tether Brain Connections and retry."
+        )
+    return identity
+
+
+async def _register_profile(paths: ProfilePaths) -> dict:
+    store = StateStore(paths.state_file)
+    settings = load_effective_settings(paths, store)
+    daemon = AgentDaemon(settings, paths=paths)
+    try:
+        return await daemon.register_once()
+    finally:
+        await daemon.api.close()
+
+
+def _print_registration(response: dict) -> None:
+    if response["status"] == "active":
+        print("Daemon installation is ready.")
+    else:
+        print(
+            "Daemon installation is registered and awaiting capability approval "
+            "in Tether Brain Agent execution settings."
+        )
+
+
+def _setup_session_status(store: StateStore) -> str:
+    setup = store.setup_session()
+    if setup is None:
+        return "none"
+    try:
+        expires_at = datetime.fromisoformat(setup["expires_at"])
+    except (KeyError, ValueError):
+        return "invalid"
+    return "resumable" if expires_at > datetime.now(UTC) else "expired"
+
+
+def _sync_registration(paths: ProfilePaths) -> None:
+    store = StateStore(paths.state_file)
+    sync_lock = ProfileLock(paths.mutation_lock, label="capability registration")
+    try:
+        sync_lock.acquire()
+    except LockUnavailable as error:
+        raise RuntimeError(
+            f"Another command is changing profile '{paths.profile}'"
+        ) from error
+    try:
+        daemon_running = ProfileLock.is_locked(paths.daemon_lock)
+        if not daemon_running:
+            _print_registration(asyncio.run(_register_profile(paths)))
+            return
+    finally:
+        sync_lock.release()
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        status = store.get_setting("daemon_status")
+        if status in {"pending_approval", "ready", "registration_error"}:
+            if status == "ready":
+                print("Running daemon reloaded the profile and is ready.")
+            elif status == "pending_approval":
+                print(
+                    "Running daemon reloaded the profile and is awaiting capability "
+                    "approval in Tether Brain."
+                )
+            else:
+                print("Running daemon reloaded the profile but registration failed.")
+            return
+        time.sleep(0.2)
+    print("Profile updated. The running daemon will reload it shortly.")
+
+
+def _mapping_from_arguments(args: argparse.Namespace) -> ProjectMapping | None:
+    if args.path is None:
+        if (
+            args.project_id is not None
+            or args.remote is not None
+            or args.allow_no_remote
+        ):
+            raise RuntimeError(
+                "--project-id, --remote, and --allow-no-remote require --path"
+            )
+        return None
+    project_id = args.project_id
+    if project_id is None:
+        raw = input("Tether Brain logical project ID: ").strip()
+        if not raw:
+            raise RuntimeError("A logical project ID is required when --path is used")
+        project_id = UUID(raw)
+    repository = inspect_repository(
+        args.path,
+        remote=args.remote,
+        allow_no_remote=args.allow_no_remote,
+    )
+    return ProjectMapping(
+        project_id=project_id,
+        local_path=repository.root,
+        access="write",
+        remote_url=repository.remote_url,
+    )
+
+
+def command_init(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    lock = ProfileLock(paths.mutation_lock, label="profile initialization")
+    try:
+        lock.acquire()
+    except LockUnavailable as error:
+        raise RuntimeError(
+            f"Another command is changing profile '{paths.profile}'"
+        ) from error
+    try:
+        return _initialize_profile(args, paths)
+    finally:
+        lock.release()
+
+
+def _initialize_profile(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    if paths.config_file.exists():
+        raise RuntimeError(
+            f"Profile '{paths.profile}' already exists. Use workspace or auth commands "
+            "to change it."
+        )
+    assert_mutation_not_shadowed(relevant_keys=CONFIGURATION_ENV_KEYS)
+    if ProfileLock.is_locked(paths.daemon_lock):
+        raise RuntimeError(
+            "A daemon is already running for this profile. Stop it and use "
+            "'tb-agent migrate env' to preserve its existing installation."
+        )
+    state_existed = paths.state_file.exists()
+    store = StateStore(paths.state_file) if state_existed else None
+    if store is not None and store.active_run_id() is not None:
+        raise RuntimeError(
+            "An execution is active in the existing local state. Wait for it to "
+            "finish before initializing this profile."
+        )
+    validate_codex_authentication()
+    deferred_repository = None
+    if args.auth == "oauth" and args.path is not None and args.project_id is None:
+        deferred_repository = inspect_repository(
+            args.path,
+            remote=args.remote,
+            allow_no_remote=args.allow_no_remote,
+        )
+        if deferred_repository.remote_url is None:
+            raise RuntimeError(
+                "Browser project selection requires a Git remote. Pass --project-id "
+                "for a repository without a remote."
+            )
+        mapping = None
+    else:
+        mapping = _mapping_from_arguments(args)
+    config = ProfileConfig(
+        server_url=args.server,
+        installation_name=args.name,
+        project_mappings=[mapping] if mapping is not None else [],
+    )
+    store = store or StateStore(paths.state_file)
+    state_backup = paths.state_dir / f".init-rollback-{uuid4().hex}.sqlite3"
+    if state_existed:
+        store.backup(state_backup)
+    try:
+        write_profile_config(paths.config_file, config)
+        store.set_configuration_revision(config.revision)
+        if args.auth == "pat":
+            print("PAT authentication is an advanced fallback.")
+            pat = getpass.getpass("Tether Brain PAT: ")
+            identity = asyncio.run(_validate_pat(args.server, pat))
+            store.set_secret("pat", pat)
+            store.set_setting("credential_id", str(identity["credential"]["id"]))
+            store.set_setting("authentication_required", "false")
+            store.set_setting("credential_revoked", "false")
+            store.set_setting("last_credential_type", "pat")
+        else:
+            result = asyncio.run(
+                oauth_login(
+                    paths=paths,
+                    config=config,
+                    repository_hints=(
+                        [
+                            {
+                                "repository_url": deferred_repository.remote_url,
+                                "access": "write",
+                            }
+                        ]
+                        if deferred_repository is not None
+                        else None
+                    ),
+                )
+            )
+            if deferred_repository is not None:
+                matches = [
+                    item
+                    for item in result.get("resolved_projects", [])
+                    if git_remote_identity(str(item["repository_url"]))
+                    == git_remote_identity(deferred_repository.remote_url)
+                ]
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        "The browser did not confirm exactly one logical project "
+                        "for this Git remote"
+                    )
+                resolved_mapping = ProjectMapping(
+                    project_id=UUID(str(matches[0]["id"])),
+                    local_path=deferred_repository.root,
+                    access="write",
+                    remote_url=deferred_repository.remote_url,
+                )
+                config = config.model_copy(
+                    update={"project_mappings": [resolved_mapping]}
+                )
+                write_profile_config(paths.config_file, config)
+    except BaseException:
+        paths.config_file.unlink(missing_ok=True)
+        if state_existed:
+            store.restore_backup(state_backup)
+        else:
+            for suffix in ("", "-wal", "-shm"):
+                Path(f"{paths.state_file}{suffix}").unlink(missing_ok=True)
+        state_backup.unlink(missing_ok=True)
+        raise
+    try:
+        registration = (
+            asyncio.run(_register_profile(paths))
+            if args.auth == "pat" or deferred_repository is not None
+            else result["installation"]
+        )
+    except BaseException:
+        paths.config_file.unlink(missing_ok=True)
+        if state_existed:
+            store.restore_backup(state_backup)
+        else:
+            for suffix in ("", "-wal", "-shm"):
+                Path(f"{paths.state_file}{suffix}").unlink(missing_ok=True)
+        raise
+    finally:
+        state_backup.unlink(missing_ok=True)
+    _print_registration(registration)
+    print(f"Profile '{paths.profile}' stored at {paths.config_file}.")
+    print(f"Run it with: tb-agent --profile {paths.profile} run")
+    return 0
+
+
+def command_run(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    settings = load_effective_settings(paths)
+    _configure_logging(paths)
+    asyncio.run(AgentDaemon(settings, paths=paths).run_forever())
+    return 0
+
+
+def command_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    if not paths.config_file.exists():
+        environment_keys = configured_environment_keys()
+        if environment_keys:
+            print(f"Profile: {paths.profile}")
+            print("Configuration: legacy environment")
+            print(
+                f"Daemon: {'running' if ProfileLock.is_locked(paths.daemon_lock) else 'stopped'}"
+            )
+            return 0
+        print(f"Profile '{paths.profile}' is not initialized.")
+        return 1
+    manager = ProfileManager(paths)
+    config = manager.config()
+    store = manager.store
+    environment_keys = configured_environment_keys()
+    environment_pat = "TETHER_AGENT_ACCESS_TOKEN" in environment_keys
+    credential = store.credential()
+    print(f"Profile: {paths.profile}")
+    print(f"Server: {config.server_url}")
+    print(f"Configuration revision: {config.revision}")
+    authentication = (
+        "PAT configured by environment"
+        if environment_pat
+        else "OAuth installation credential"
+        if credential is not None
+        else "PAT advanced fallback"
+        if store.get_secret("pat")
+        else "logged out"
+    )
+    print(f"Authentication: {authentication}")
+    if credential is not None:
+        validity = (
+            "revoked"
+            if credential.revoked_at is not None
+            else "expired"
+            if credential.access_expires_at <= datetime.now(UTC)
+            else "valid"
+        )
+        print(f"Credential validity: {validity}")
+        print(f"Credential generation: {credential.generation}")
+        print(f"Access token expiration: {credential.access_expires_at.isoformat()}")
+        print(
+            "Refresh status: "
+            + ("recovery pending" if credential.recovery_rotation_id else "ready")
+        )
+        print(
+            "Reauthentication required: "
+            + ("yes" if credential.reauthentication_required else "no")
+        )
+        if environment_pat:
+            print("Stored OAuth credential shadowed by environment PAT: yes")
+    print(f"Installation: {store.get_setting('installation_id') or 'not registered'}")
+    print(f"Agent Profile: {store.get_setting('agent_profile_id') or 'not reported'}")
+    print(f"Capability state: {store.get_setting('installation_status') or 'unknown'}")
+    print(
+        "Authentication required: "
+        + ("yes" if store.get_setting("authentication_required") == "true" else "no")
+    )
+    print(
+        "Installation revocation: "
+        + (
+            "revoked"
+            if credential is not None
+            and credential.revoked_at is not None
+            or store.get_setting("credential_revoked") == "true"
+            else "not reported"
+        )
+    )
+    print(
+        f"Daemon: {'running' if ProfileLock.is_locked(paths.daemon_lock) else 'stopped'}"
+    )
+    print(f"Daemon state: {store.get_setting('daemon_status') or 'unknown'}")
+    active_run = store.active_run_id()
+    print(f"Active execution: {active_run or 'none'}")
+    print(f"Workspace mappings: {len(config.project_mappings)}")
+    if environment_keys:
+        print("Environment overrides: " + ", ".join(sorted(environment_keys)))
+    print(f"Incomplete setup session: {_setup_session_status(store)}")
+    return 0
+
+
+def command_workspace_add(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    repository = inspect_repository(
+        args.path,
+        remote=args.remote,
+        allow_no_remote=args.allow_no_remote,
+    )
+    project_id = args.project_id
+    if args.setup_reference:
+        settings = load_effective_settings(paths)
+        daemon = AgentDaemon(settings, paths=paths)
+
+        async def redeem() -> dict:
+            try:
+                return await daemon.api.redeem_workspace_setup_reference(
+                    args.setup_reference
+                )
+            finally:
+                await daemon.api.close()
+
+        resolved = asyncio.run(redeem())
+        if project_id is not None and str(project_id) != str(resolved["project_id"]):
+            raise RuntimeError("Setup reference does not match --project-id")
+        project_id = UUID(str(resolved["project_id"]))
+        expected_remote = normalize_git_remote(str(resolved["repository_url"]))
+        if repository.remote_url is None or git_remote_identity(
+            repository.remote_url
+        ) != git_remote_identity(expected_remote):
+            raise RuntimeError(
+                "The current Git remote does not match the browser-confirmed repository"
+            )
+    if project_id is None:
+        raw = input(
+            "Logical project ID, or generate a setup command from Tether Brain "
+            "Agent execution settings: "
+        ).strip()
+        if not raw:
+            raise RuntimeError("A logical project ID or --setup-reference is required")
+        project_id = UUID(raw)
+    mapping = ProjectMapping(
+        project_id=project_id,
+        local_path=repository.root,
+        access=args.access,
+        remote_url=repository.remote_url,
+    )
+    manager = ProfileManager(paths)
+    if (
+        manager.store.credential() is None
+        and manager.store.get_secret("pat") is None
+        and "TETHER_AGENT_ACCESS_TOKEN" not in configured_environment_keys()
+    ):
+        raise RuntimeError("Authenticate this profile before changing workspaces")
+    oauth_result: dict | None = None
+
+    def add(config: ProfileConfig) -> ProfileConfig:
+        if any(
+            item.project_id == mapping.project_id for item in config.project_mappings
+        ):
+            raise RuntimeError(f"Project {mapping.project_id} is already mapped")
+        if any(
+            item.local_path == mapping.local_path for item in config.project_mappings
+        ):
+            raise RuntimeError(f"Repository {mapping.local_path} is already mapped")
+        return config.model_copy(
+            update={"project_mappings": [*config.project_mappings, mapping]}
+        )
+
+    proposed = add(manager.config())
+
+    def authorize_change() -> None:
+        nonlocal oauth_result
+        if manager.store.credential() is not None:
+            oauth_result = asyncio.run(
+                oauth_login(paths=paths, config=proposed, mode="login")
+            )
+
+    manager.mutate(
+        add,
+        environment_keys=WORKSPACE_ENV_KEYS,
+        state_change=authorize_change,
+    )
+    if oauth_result is not None:
+        _print_registration(oauth_result["installation"])
+        _warn_environment_pat_shadow()
+    else:
+        _sync_registration(paths)
+        print(
+            "If this workspace is not already granted to the PAT, add it in "
+            "Tether Brain Connections."
+        )
+    return 0
+
+
+def command_workspace_remove(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    manager = ProfileManager(paths)
+    if (
+        manager.store.credential() is None
+        and manager.store.get_secret("pat") is None
+        and "TETHER_AGENT_ACCESS_TOKEN" not in configured_environment_keys()
+    ):
+        raise RuntimeError("Authenticate this profile before changing workspaces")
+    oauth_result: dict | None = None
+
+    def remove(config: ProfileConfig) -> ProfileConfig:
+        retained = [
+            item
+            for item in config.project_mappings
+            if item.project_id != args.project_id
+        ]
+        if len(retained) == len(config.project_mappings):
+            raise RuntimeError(f"Project {args.project_id} is not mapped")
+        return config.model_copy(update={"project_mappings": retained})
+
+    proposed = remove(manager.config())
+
+    def authorize_change() -> None:
+        nonlocal oauth_result
+        if manager.store.credential() is not None:
+            oauth_result = asyncio.run(
+                oauth_login(paths=paths, config=proposed, mode="login")
+            )
+
+    manager.mutate(
+        remove,
+        environment_keys=WORKSPACE_ENV_KEYS,
+        state_change=authorize_change,
+    )
+    if oauth_result is not None:
+        _print_registration(oauth_result["installation"])
+        _warn_environment_pat_shadow()
+    else:
+        _sync_registration(paths)
+    return 0
+
+
+def command_workspace_list(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    environment_keys = configured_environment_keys()
+    if "TETHER_AGENT_PROJECT_MAPPINGS" in environment_keys:
+        mappings = DaemonSettings().project_mappings
+        print("Workspace mappings are supplied by the environment.")
+    elif paths.config_file.exists():
+        mappings = ProfileManager(paths).config().project_mappings
+    else:
+        raise RuntimeError(
+            f"Profile '{paths.profile}' is not initialized. Run init or migrate env."
+        )
+    if not mappings:
+        print("No workspace mappings are configured.")
+        return 0
+    for mapping in mappings:
+        print(f"{mapping.project_id}\t{mapping.access}\t{mapping.local_path}")
+        print(f"  remote: {mapping.remote_url or 'none'}")
+    return 0
+
+
+def command_auth_set_pat(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    manager = ProfileManager(paths)
+    config = manager.config()
+    oauth_credential = manager.store.credential()
+    previously_oauth = (
+        oauth_credential is not None
+        or manager.store.get_setting("last_credential_type") == "oauth_installation"
+    )
+    if previously_oauth:
+        confirmation = input(
+            "Switch this installation from OAuth to PAT fallback? Type 'switch-to-pat': "
+        ).strip()
+        if confirmation != "switch-to-pat":
+            raise RuntimeError("PAT fallback switch was cancelled")
+    pat = getpass.getpass("Tether Brain PAT: ")
+    identity = asyncio.run(_validate_pat(config.server_url, pat))
+    credential_id = str(identity["credential"]["id"])
+    existing_credential_id = manager.store.get_setting("credential_id")
+    if (
+        oauth_credential is None
+        and existing_credential_id
+        and existing_credential_id != credential_id
+    ):
+        raise RuntimeError(
+            "This installation is bound to a different PAT identity. Phase 1 cannot "
+            "rebind installations. Restore the original PAT or create a new profile."
+        )
+
+    def store_pat() -> None:
+        if previously_oauth:
+            installation_id = manager.store.get_setting("installation_id")
+            if installation_id is None:
+                raise RuntimeError("Installation identity is missing")
+            response = httpx.post(
+                f"{config.server_url}/api/agent/v1/credentials/use-pat",
+                headers={"Authorization": f"Bearer {pat}"},
+                json={"installation_id": installation_id},
+                timeout=30,
+            )
+            response.raise_for_status()
+            manager.store.delete_credentials()
+        manager.store.set_secret("pat", pat)
+        manager.store.set_setting("credential_id", credential_id)
+        manager.store.set_setting("authentication_required", "false")
+        manager.store.set_setting("credential_revoked", "false")
+        manager.store.set_setting("last_credential_type", "pat")
+
+    manager.mutate(
+        lambda current: current,
+        environment_keys=AUTH_ENV_KEYS,
+        state_change=store_pat,
+    )
+    _sync_registration(paths)
+    print("PAT updated without exposing its value.")
+    return 0
+
+
+def _warn_environment_pat_shadow() -> bool:
+    if "TETHER_AGENT_ACCESS_TOKEN" not in configured_environment_keys():
+        return False
+    print("Warning: TETHER_AGENT_ACCESS_TOKEN still shadows stored OAuth credentials.")
+    print(
+        "Run 'unset TETHER_AGENT_ACCESS_TOKEN' and remove it from the environment source that sets it."
+    )
+    return True
+
+
+def _oauth_mutation_environment_keys() -> frozenset[str]:
+    return AUTH_ENV_KEYS - {"TETHER_AGENT_ACCESS_TOKEN"}
+
+
+def command_auth_login(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    manager = ProfileManager(paths)
+    config = manager.config()
+    result: dict = {}
+
+    def login() -> None:
+        nonlocal result
+        result = asyncio.run(oauth_login(paths=paths, config=config, mode="login"))
+        manager.store.delete_secret("pat")
+
+    manager.mutate(
+        lambda current: current,
+        environment_keys=_oauth_mutation_environment_keys(),
+        state_change=login,
+    )
+    shadowed = _warn_environment_pat_shadow()
+    _print_registration(result["installation"])
+    if shadowed:
+        print(
+            "OAuth login is stored but is not yet the effective authentication method."
+        )
+        return 1
+    print("OAuth installation authentication is active.")
+    return 0
+
+
+def command_auth_migrate(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    manager = ProfileManager(paths)
+    if manager.store.credential() is not None:
+        print(
+            "Installation already has OAuth installation credentials. No changes made."
+        )
+        if _warn_environment_pat_shadow():
+            print(
+                "Migration is not complete until the environment PAT override is removed."
+            )
+            return 1
+        return 0
+    if (
+        manager.store.get_secret("pat") is None
+        and "TETHER_AGENT_ACCESS_TOKEN" not in configured_environment_keys()
+    ):
+        raise RuntimeError("This profile has no PAT installation to migrate")
+    if manager.store.get_setting("installation_id") is None:
+        raise RuntimeError("Register the PAT installation before migrating it")
+    config = manager.config()
+    result: dict = {}
+
+    def migrate() -> None:
+        nonlocal result
+        result = asyncio.run(oauth_login(paths=paths, config=config, mode="migrate"))
+        manager.store.delete_secret("pat")
+
+    manager.mutate(
+        lambda current: current,
+        environment_keys=_oauth_mutation_environment_keys(),
+        state_change=migrate,
+    )
+    shadowed = _warn_environment_pat_shadow()
+    _print_registration(result["installation"])
+    if shadowed:
+        print(
+            "Migration is not complete until the environment PAT override is removed."
+        )
+        return 1
+    print(
+        "PAT installation migrated to OAuth without changing its installation identity."
+    )
+    return 0
+
+
+def command_auth_refresh(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    manager = ProfileManager(paths)
+    config = manager.config()
+    refreshed = None
+
+    def refresh() -> None:
+        nonlocal refreshed
+        refreshed = asyncio.run(
+            refresh_credential(paths=paths, server_url=config.server_url, force=True)
+        )
+
+    manager.mutate(
+        lambda current: current,
+        environment_keys=_oauth_mutation_environment_keys(),
+        state_change=refresh,
+    )
+    assert refreshed is not None
+    print(f"OAuth credential refreshed to generation {refreshed.generation}.")
+    _warn_environment_pat_shadow()
+    return 0
+
+
+def command_auth_revoke(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    if ProfileLock.is_locked(paths.daemon_lock):
+        raise RuntimeError("Stop the daemon before revoking installation credentials")
+    manager = ProfileManager(paths)
+    config = manager.config()
+    credential = manager.store.credential()
+    if credential is None:
+        print("No OAuth installation credential is configured.")
+        return 0
+
+    def revoke() -> None:
+        response = httpx.post(
+            f"{config.server_url}/api/agent/v1/credentials/revoke",
+            headers={"Authorization": f"Bearer {credential.access_token}"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        manager.store.delete_credentials()
+        manager.store.set_setting("authentication_required", "true")
+        manager.store.set_setting("credential_revoked", "true")
+
+    manager.mutate(
+        lambda current: current,
+        environment_keys=_oauth_mutation_environment_keys(),
+        state_change=revoke,
+    )
+    print("Installation credentials were revoked server-side and removed locally.")
+    _warn_environment_pat_shadow()
+    if args.purge:
+        paths.config_file.unlink(missing_ok=True)
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{paths.state_file}{suffix}").unlink(missing_ok=True)
+        print("Profile configuration and state were purged.")
+    return 0
+
+
+def command_auth_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    environment_pat = "TETHER_AGENT_ACCESS_TOKEN" in configured_environment_keys()
+    if not paths.config_file.exists():
+        if environment_pat:
+            print("Authentication: PAT configured by environment")
+            print("Credential identity: stored in the legacy installation state")
+            return 0
+        print(f"Profile '{paths.profile}' is not initialized.")
+        return 1
+    manager = ProfileManager(paths)
+    credential = manager.store.credential()
+    configured = (
+        environment_pat
+        or credential is not None
+        or manager.store.get_secret("pat") is not None
+    )
+    status = (
+        "PAT configured by environment"
+        if environment_pat
+        else "OAuth installation credential"
+        if credential is not None
+        else "PAT configured"
+        if configured
+        else "logged out"
+    )
+    print(f"Authentication: {status}")
+    if credential is not None:
+        now = datetime.now(UTC)
+        remote_status: dict | None = None
+        if credential.access_expires_at > now and not environment_pat:
+            try:
+                remote_status = asyncio.run(
+                    validate_installation_credential(
+                        server_url=manager.config().server_url,
+                        access_token=credential.access_token,
+                    )
+                )
+            except httpx.HTTPError:
+                remote_status = None
+        validity = (
+            "reauthentication required"
+            if credential.reauthentication_required
+            else "revoked"
+            if credential.revoked_at is not None
+            else "expired"
+            if credential.access_expires_at <= now
+            else "valid"
+        )
+        print(f"Credential validity: {validity}")
+        print(f"Access token expiration: {credential.access_expires_at.isoformat()}")
+        print(
+            f"Refresh status: {'recovery pending' if credential.recovery_rotation_id else 'ready'}"
+        )
+        print(f"Credential generation: {credential.generation}")
+        print(f"Credential family: {credential.family_id}")
+        revocation = (
+            "revoked"
+            if credential.revoked_at
+            or remote_status is not None
+            and remote_status.get("revoked")
+            else "not revoked"
+            if remote_status is not None
+            else "not reported"
+        )
+        print(f"Installation revocation: {revocation}")
+        print(
+            f"Reauthentication required: {'yes' if credential.reauthentication_required else 'no'}"
+        )
+    else:
+        print(
+            f"Credential identity: {manager.store.get_setting('credential_id') or 'unknown'}"
+        )
+        print(
+            "Installation revocation: "
+            + (
+                "revoked"
+                if manager.store.get_setting("credential_revoked") == "true"
+                else "not reported"
+            )
+        )
+        print(
+            "Reauthentication required: "
+            + (
+                "yes"
+                if manager.store.get_setting("authentication_required") == "true"
+                else "no"
+            )
+        )
+    print(f"Incomplete setup session: {_setup_session_status(manager.store)}")
+    if environment_pat and credential is not None:
+        print("Stored OAuth credential shadowed by environment PAT: yes")
+        _warn_environment_pat_shadow()
+    return 0 if configured else 1
+
+
+def command_auth_logout(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    manager = ProfileManager(paths)
+    if manager.store.get_secret("pat") is None and manager.store.credential() is None:
+        print("Profile is already logged out.")
+        return 0
+    manager.mutate(
+        lambda current: current,
+        environment_keys=AUTH_ENV_KEYS,
+        state_change=lambda: (
+            manager.store.delete_secret("pat"),
+            manager.store.delete_credentials(),
+            manager.store.clear_setup_session(),
+        ),
+    )
+    manager.store.set_setting("authentication_required", "true")
+    print(
+        "Local credentials removed. Installation and Agent Profile identities were preserved."
+    )
+    _warn_environment_pat_shadow()
+    return 0
+
+
+def command_service(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    action = args.service_command.replace("-", "_")
+    if action in {"install", "start", "restart"}:
+        if not paths.config_file.exists():
+            raise RuntimeError(
+                "Initialize or migrate this profile before managing its service"
+            )
+        load_effective_settings(paths)
+    manager = ServiceManager(paths)
+    result = getattr(manager, action)()
+    return int(result or 0)
+
+
+def command_codex_skill(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del paths
+    if args.skill_command == "install":
+        destination = install_skill()
+        print(f"Tether Brain Codex skill installed at {destination}.")
+        print(
+            "Codex detects skill changes automatically. Start a new session if it is not listed yet."
+        )
+        return 0
+    if args.skill_command == "uninstall":
+        destination = uninstall_skill()
+        print(f"Tether Brain Codex skill removed from {destination}.")
+        return 0
+    status_value, destination = skill_status()
+    print(f"Tether Brain Codex skill: {status_value}")
+    print(f"Location: {destination}")
+    return 0 if status_value == "installed" else 1
+
+
+def _add_repository_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--path", type=Path, required=True)
+    parser.add_argument("--project-id", type=UUID)
+    parser.add_argument("--setup-reference")
+    parser.add_argument("--remote")
+    parser.add_argument("--allow-no-remote", action="store_true")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="tb-agent")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    parser.add_argument("--profile", default=DEFAULT_PROFILE)
+    commands = parser.add_subparsers(dest="command")
+
+    init = commands.add_parser("init")
+    init.add_argument("--server", default="https://tetherbrain.net")
+    init.add_argument("--path", type=Path)
+    init.add_argument("--project-id", type=UUID)
+    init.add_argument("--remote")
+    init.add_argument("--allow-no-remote", action="store_true")
+    init.add_argument("--name", default="Local Codex agent")
+    init.add_argument("--auth", choices=("oauth", "pat"), default="oauth")
+    init.set_defaults(handler=command_init)
+
+    run = commands.add_parser("run")
+    run.set_defaults(handler=command_run)
+    status = commands.add_parser("status")
+    status.set_defaults(handler=command_status)
+
+    migrate = commands.add_parser("migrate")
+    migrate_commands = migrate.add_subparsers(dest="migrate_command", required=True)
+    migrate_env = migrate_commands.add_parser("env")
+    migrate_env.add_argument("--dry-run", action="store_true")
+
+    workspace = commands.add_parser("workspace")
+    workspace_commands = workspace.add_subparsers(
+        dest="workspace_command",
+        required=True,
+    )
+    workspace_add = workspace_commands.add_parser("add")
+    _add_repository_arguments(workspace_add)
+    workspace_add.add_argument("--access", choices=("read", "write"), default="write")
+    workspace_add.set_defaults(handler=command_workspace_add)
+    workspace_list = workspace_commands.add_parser("list")
+    workspace_list.set_defaults(handler=command_workspace_list)
+    workspace_remove = workspace_commands.add_parser("remove")
+    workspace_remove.add_argument("project_id", type=UUID)
+    workspace_remove.set_defaults(handler=command_workspace_remove)
+
+    auth = commands.add_parser("auth")
+    auth_commands = auth.add_subparsers(dest="auth_command", required=True)
+    auth_set_pat = auth_commands.add_parser("set-pat")
+    auth_set_pat.set_defaults(handler=command_auth_set_pat)
+    auth_status = auth_commands.add_parser("status")
+    auth_status.set_defaults(handler=command_auth_status)
+    auth_logout = auth_commands.add_parser("logout")
+    auth_logout.set_defaults(handler=command_auth_logout)
+    auth_login = auth_commands.add_parser("login")
+    auth_login.set_defaults(handler=command_auth_login)
+    auth_migrate = auth_commands.add_parser("migrate")
+    auth_migrate.set_defaults(handler=command_auth_migrate)
+    auth_refresh = auth_commands.add_parser("refresh")
+    auth_refresh.set_defaults(handler=command_auth_refresh)
+    auth_revoke = auth_commands.add_parser("revoke")
+    auth_revoke.add_argument("--purge", action="store_true")
+    auth_revoke.set_defaults(handler=command_auth_revoke)
+
+    service = commands.add_parser("service")
+    service_commands = service.add_subparsers(dest="service_command", required=True)
+    for action in (
+        "install",
+        "uninstall",
+        "start",
+        "stop",
+        "restart",
+        "status",
+        "logs",
+    ):
+        item = service_commands.add_parser(action)
+        item.set_defaults(handler=command_service)
+
+    codex = commands.add_parser("codex")
+    codex_commands = codex.add_subparsers(dest="codex_command", required=True)
+    codex_skill = codex_commands.add_parser("skill")
+    codex_skill_commands = codex_skill.add_subparsers(
+        dest="skill_command", required=True
+    )
+    for action in ("install", "status", "uninstall"):
+        item = codex_skill_commands.add_parser(action)
+        item.set_defaults(handler=command_codex_skill)
+    return parser
+
+
+def run_cli(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command is None:
+        args = parser.parse_args(["--profile", args.profile, "run"])
+    paths = ProfilePaths.resolve(args.profile)
+    if args.command == "migrate":
+        from tether_agent.migration import migrate_environment
+
+        return migrate_environment(paths, dry_run=args.dry_run)
+    handler = getattr(args, "handler", None)
+    if handler is None:
+        parser.error("a command is required")
+    return int(handler(args, paths))
+
+
+def safe_error_message(error: BaseException) -> str:
+    return TOKEN_PATTERN.sub("[REDACTED CREDENTIAL]", str(error))
+
+
+def main() -> None:
+    try:
+        raise SystemExit(run_cli())
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+    except (httpx.HTTPError, OSError, RuntimeError, ValueError) as error:
+        print(f"Error: {safe_error_message(error)}", file=sys.stderr)
+        raise SystemExit(1) from None

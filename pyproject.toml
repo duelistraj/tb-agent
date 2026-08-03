@@ -1,0 +1,66 @@
+[project]
+name = "tb-agent"
+version = "0.5.0"
+description = "Local execution daemon for Tether Brain agent installations"
+readme = "README.md"
+license = "AGPL-3.0-only"
+authors = [{ name = "Tether Brain" }]
+requires-python = ">=3.11"
+keywords = ["tether-brain", "codex", "agent", "daemon"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+]
+dependencies = [
+    "httpx>=0.28,<1",
+    "openai-codex>=0.1,<1",
+    "pydantic>=2.12,<3",
+    "pydantic-settings>=2.12,<3",
+]
+
+[project.scripts]
+tb-agent = "tether_agent.main:main"
+tether-agent = "tether_agent.main:deprecated_main"
+
+[project.urls]
+Homepage = "https://tetherbrain.net"
+Documentation = "https://github.com/duelistraj/tb-agent#readme"
+Source = "https://github.com/duelistraj/tb-agent"
+Issues = "https://github.com/duelistraj/tb-agent/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tether_agent"]
+
+[tool.hatch.build]
+include = [
+    "LICENSE",
+    "README.md",
+    "src/tether_agent/**/*.py",
+    "src/tether_agent/skills/**/*.md",
+    "src/tether_agent/skills/**/*.yaml",
+]
+
+[dependency-groups]
+dev = [
+    "pip-audit>=2.9,<3",
+    "pytest>=9,<10",
+    "pytest-asyncio>=1.3,<2",
+    "ruff>=0.12,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

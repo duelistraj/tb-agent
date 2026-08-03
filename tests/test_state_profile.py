@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import stat
 import threading
@@ -46,8 +47,9 @@ def test_state_uses_wal_transactions_and_private_permissions(tmp_path: Path) -> 
     assert mode == "wal"
     assert timeout == 5_000
     assert store.get_setting("rollback") is None
-    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
-    assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
+    if os.name != "nt":
+        assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
 
 
 def test_state_backup_preserves_identity_leases_and_threads(tmp_path: Path) -> None:
@@ -71,6 +73,29 @@ def test_state_backup_preserves_identity_leases_and_threads(tmp_path: Path) -> N
     assert restored.get_setting("agent_profile_id") == str(profile_id)
     assert restored.leased_run_ids() == [run_id]
     assert restored.thread_id(run_id) == "codex-thread"
+
+
+def test_state_backup_closes_every_sqlite_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = StateStore(tmp_path / "source/state.sqlite3")
+    original_connect = sqlite3.connect
+    closed: list[bool] = []
+
+    class TrackingConnection(sqlite3.Connection):
+        def close(self) -> None:
+            closed.append(True)
+            super().close()
+
+    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        return original_connect(*args, **kwargs, factory=TrackingConnection)
+
+    monkeypatch.setattr("tether_agent.state.sqlite3.connect", connect)
+
+    source.backup(tmp_path / "backup/state.sqlite3")
+
+    assert closed == [True, True]
 
 
 def test_profile_lock_allows_only_one_holder(tmp_path: Path) -> None:

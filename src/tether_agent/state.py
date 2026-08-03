@@ -6,7 +6,7 @@ import os
 import sqlite3
 import stat
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -255,8 +255,12 @@ class StateStore:
         descriptor = os.open(destination, flags, FILE_MODE)
         os.close(descriptor)
         try:
-            with self.connection() as source, sqlite3.connect(destination) as target:
+            with (
+                self.connection() as source,
+                closing(sqlite3.connect(destination)) as target,
+            ):
                 source.backup(target)
+                target.commit()
             destination.chmod(FILE_MODE)
         except BaseException:
             destination.unlink(missing_ok=True)
@@ -264,7 +268,10 @@ class StateStore:
 
     def restore_backup(self, source: Path) -> None:
         validate_private_file(source, allow_missing=False)
-        with sqlite3.connect(source) as backup, sqlite3.connect(self.path) as target:
+        with (
+            closing(sqlite3.connect(source)) as backup,
+            closing(sqlite3.connect(self.path)) as target,
+        ):
             backup.backup(target)
             target.commit()
         self._secure_sidecars()

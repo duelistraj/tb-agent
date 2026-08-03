@@ -78,8 +78,9 @@ def test_profile_config_round_trip_has_private_permissions(
     assert load_profile_config(paths.config_file) == config.model_copy(
         update={"server_url": "https://tetherbrain.net"}
     )
-    assert stat.S_IMODE(paths.config_dir.stat().st_mode) == 0o700
-    assert stat.S_IMODE(paths.config_file.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(paths.config_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(paths.config_file.stat().st_mode) == 0o600
 
 
 def test_environment_overrides_profile_without_changing_stored_config(

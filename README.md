@@ -47,6 +47,9 @@ For OAuth setup, the server resolves the normalized Git remote to exactly one ac
 If the browser cannot be opened, the CLI prints the authorization URL without printing authorization codes or credentials.
 Initialization validates the Git worktree, resolves its canonical root, discovers and normalizes its remote, checks Codex authentication, registers or reuses the stored installation identity, and reports whether capability approval is pending.
 Initialization never installs a background service.
+Running the same command again is safe.
+For a healthy profile it reports that the repository is already configured, and for a browser-revoked installation it offers to create a fresh installation through the same guided OAuth flow.
+The replacement keeps safe local repository and runtime settings but clears revoked credentials, leases, Codex thread state, and old server identities only after the new credential is validated.
 
 Use PAT fallback only when browser OAuth is unavailable or the server does not support it:
 
@@ -69,6 +72,7 @@ Inspect local state without revealing credentials:
 
 ```bash
 tb-agent status
+tb-agent status --offline
 ```
 
 ## Profiles
@@ -84,6 +88,17 @@ tb-agent --profile work status
 
 Each profile has an independent configuration, credential, installation identity, daemon lock, and optional service.
 Only one daemon process may run for a profile.
+`default` is only the local profile name used when `--profile` is omitted.
+
+List or remove local profiles without manually finding platform-specific directories:
+
+```bash
+tb-agent profile list
+tb-agent --profile work profile remove
+```
+
+Profile removal revokes the stored server credential when possible and removes the profile's local configuration, credentials, and service definition.
+Use `--local-only` only after browser revocation or when intentionally leaving server cleanup for later.
 
 ## Workspaces
 

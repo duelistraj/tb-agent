@@ -12,7 +12,12 @@ from tether_agent.cli import (
     run_cli,
     safe_error_message,
 )
-from tether_agent.config import load_profile_config
+from tether_agent.config import (
+    ProfileConfig,
+    ProjectMapping,
+    load_profile_config,
+    write_profile_config,
+)
 from tether_agent.paths import ProfilePaths
 from tether_agent.services import (
     ServiceManager,
@@ -37,6 +42,8 @@ def test_parser_exposes_every_phase_one_command() -> None:
         ["workspace", "add", "--path", ".", "--project-id", str(uuid4())],
         ["workspace", "list"],
         ["workspace", "remove", str(uuid4())],
+        ["profile", "list"],
+        ["profile", "remove", "--local-only", "--yes"],
         ["auth", "set-pat"],
         ["auth", "status"],
         ["auth", "logout"],
@@ -56,6 +63,159 @@ def test_parser_exposes_every_phase_one_command() -> None:
     for command in commands:
         parsed = parser.parse_args(["--profile", "testing", *command])
         assert parsed.profile == "testing"
+
+
+def test_existing_revoked_profile_is_replaced_by_init_without_manual_cleanup(
+    tmp_path: Path,
+    git_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    set_profile_homes(tmp_path, monkeypatch)
+    paths = ProfilePaths.resolve("default")
+    project_id = uuid4()
+    old_installation_id = uuid4()
+    write_profile_config(
+        paths.config_file,
+        ProfileConfig(
+            server_url="https://tetherbrain.net",
+            installation_name="Local Codex agent",
+            project_mappings=[
+                ProjectMapping(
+                    project_id=project_id,
+                    local_path=git_repository,
+                    remote_url="ssh://git@github.com/TetherBrain/example",
+                )
+            ],
+        ),
+    )
+    store = StateStore(paths.state_file)
+    store.set_setting("installation_id", str(old_installation_id))
+    captured: dict[str, object] = {}
+
+    async def login(**kwargs: object) -> dict:
+        captured.update(kwargs)
+        return {
+            "installation": {
+                "id": str(uuid4()),
+                "status": "pending_approval",
+            }
+        }
+
+    monkeypatch.setattr(
+        "tether_agent.cli._reconcile_oauth_credential", lambda **kwargs: "revoked"
+    )
+    monkeypatch.setattr("tether_agent.cli.validate_codex_authentication", lambda: None)
+    monkeypatch.setattr("tether_agent.cli.oauth_login", login)
+
+    assert run_cli(["init", "--path", str(git_repository), "--yes"]) == 0
+
+    assert captured["intent"] == "replace"
+    assert captured["replaces_installation_id"] == str(old_installation_id)
+    assert captured["replacement_operation_id"]
+    assert load_profile_config(paths.config_file).revision == 2
+    output = capsys.readouterr().out
+    assert "fresh installation" in output
+    assert "already exists" not in output
+
+
+def test_replacement_reports_an_environment_pat_that_shadows_new_oauth(
+    tmp_path: Path,
+    git_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    set_profile_homes(tmp_path, monkeypatch)
+    monkeypatch.setenv("TETHER_AGENT_ACCESS_TOKEN", "tb_pat_environment")
+    paths = ProfilePaths.resolve("default")
+    old_installation_id = uuid4()
+    write_profile_config(
+        paths.config_file,
+        ProfileConfig(
+            project_mappings=[
+                ProjectMapping(
+                    project_id=uuid4(),
+                    local_path=git_repository,
+                    remote_url="ssh://git@github.com/TetherBrain/example",
+                )
+            ],
+        ),
+    )
+    store = StateStore(paths.state_file)
+    store.set_setting("installation_id", str(old_installation_id))
+
+    async def login(**kwargs: object) -> dict:
+        del kwargs
+        return {
+            "installation": {
+                "id": str(uuid4()),
+                "status": "pending_approval",
+            }
+        }
+
+    monkeypatch.setattr(
+        "tether_agent.cli._reconcile_oauth_credential", lambda **kwargs: "revoked"
+    )
+    monkeypatch.setattr("tether_agent.cli.validate_codex_authentication", lambda: None)
+    monkeypatch.setattr("tether_agent.cli.oauth_login", login)
+
+    assert run_cli(["init", "--path", str(git_repository), "--yes"]) == 1
+
+    output = capsys.readouterr().out
+    assert "unset TETHER_AGENT_ACCESS_TOKEN" in output
+    assert "not complete" in output
+    assert store.get_setting("replacement_operation_id") is None
+
+
+def test_existing_healthy_profile_init_is_an_idempotent_no_op(
+    tmp_path: Path,
+    git_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    set_profile_homes(tmp_path, monkeypatch)
+    paths = ProfilePaths.resolve("default")
+    project_id = uuid4()
+    write_profile_config(
+        paths.config_file,
+        ProfileConfig(
+            server_url="https://tetherbrain.net",
+            project_mappings=[
+                ProjectMapping(
+                    project_id=project_id,
+                    local_path=git_repository,
+                    remote_url="ssh://git@github.com/TetherBrain/example",
+                )
+            ],
+        ),
+    )
+    StateStore(paths.state_file)
+    monkeypatch.setattr(
+        "tether_agent.cli._reconcile_oauth_credential", lambda **kwargs: "valid"
+    )
+
+    assert run_cli(["init", "--path", str(git_repository)]) == 0
+    assert load_profile_config(paths.config_file).revision == 1
+    assert "No changes were needed" in capsys.readouterr().out
+
+
+def test_profile_remove_local_only_is_explicit_and_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_profile_homes(tmp_path, monkeypatch)
+    paths = ProfilePaths.resolve("team")
+    write_profile_config(paths.config_file, ProfileConfig())
+    StateStore(paths.state_file)
+    monkeypatch.setattr(
+        "tether_agent.cli.ServiceManager.is_installed", lambda self: False
+    )
+
+    command = ["--profile", "team", "profile", "remove", "--local-only", "--yes"]
+    assert run_cli(command) == 0
+    assert not paths.config_dir.exists()
+    assert not paths.state_dir.exists()
+    assert run_cli(command) == 0
 
 
 def test_init_uses_hidden_pat_and_creates_private_profile(

@@ -3,6 +3,7 @@ import sqlite3
 import stat
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -259,3 +260,41 @@ def test_sqlite_busy_timeout_allows_serialized_writers(tmp_path: Path) -> None:
 
     assert completed.is_set()
     assert store.get_setting("second") == "writer"
+
+
+def test_replacement_activation_clears_server_bound_state_atomically(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state/state.sqlite3")
+    old_installation_id = str(uuid4())
+    run_id = uuid4()
+    store.set_setting("installation_id", old_installation_id)
+    store.set_setting("agent_profile_id", str(uuid4()))
+    store.set_secret("pat", "tb_pat_old")
+    store.save_claim(run_id, 1, "lease-secret")
+    store.save_thread(run_id, "codex-thread-old")
+
+    new_installation_id = str(uuid4())
+    new_profile_id = str(uuid4())
+    store.activate_replacement_credential(
+        access_token="tb_iat_new",
+        refresh_token="tb_irt_new",
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+        generation=1,
+        oauth_client_id="tb-agent-cli",
+        family_id=str(uuid4()),
+        installation={
+            "id": new_installation_id,
+            "status": "pending_approval",
+            "profiles": [{"id": new_profile_id, "runtime_kind": "codex_cli"}],
+        },
+    )
+
+    credential = store.credential()
+    assert credential is not None
+    assert credential.access_token == "tb_iat_new"
+    assert store.get_setting("installation_id") == new_installation_id
+    assert store.get_setting("agent_profile_id") == new_profile_id
+    assert store.get_secret("pat") is None
+    assert store.active_run_id() is None
+    assert store.thread_id(run_id) is None

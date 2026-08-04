@@ -297,6 +297,7 @@ async def _oauth_login_unlocked(
     paths: ProfilePaths,
     config: ProfileConfig,
     mode: str = "login",
+    intent: str = "reauthorize",
     repository_hints: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     store = StateStore(paths.state_file)
@@ -305,6 +306,7 @@ async def _oauth_login_unlocked(
     if (
         incomplete is not None
         and incomplete["mode"] == mode
+        and incomplete["intent"] == intent
         and incomplete["issuer"] == metadata["issuer"]
         and datetime.fromisoformat(incomplete["expires_at"]) > datetime.now(UTC)
     ):
@@ -349,6 +351,7 @@ async def _oauth_login_unlocked(
         "protocol_version": config.protocol_version,
         "daemon_version": __version__,
         "mode": mode,
+        "intent": intent,
         "projects": [
             {
                 "project_id": str(mapping.project_id),
@@ -384,6 +387,7 @@ async def _oauth_login_unlocked(
         "client_id": str(metadata["tether_agent_native_client_id"]),
         "expires_at": str(created["expires_at"]),
         "mode": mode,
+        "intent": intent,
     }
     store.save_setup_session(local_session)
     _open_authorization(str(created["authorization_url"]))
@@ -398,6 +402,7 @@ async def oauth_login(
     paths: ProfilePaths,
     config: ProfileConfig,
     mode: str = "login",
+    intent: str = "reauthorize",
     repository_hints: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     lock = ProfileLock(paths.credential_lock, label="OAuth credential change")
@@ -412,6 +417,7 @@ async def oauth_login(
             paths=paths,
             config=config,
             mode=mode,
+            intent=intent,
             repository_hints=repository_hints,
         )
     finally:

@@ -24,9 +24,9 @@ uv tool install .
 
 The source is maintained at [github.com/duelistraj/tb-agent](https://github.com/duelistraj/tb-agent).
 
-The former `tether-agent` executable remains as a deprecated alias in the 0.5.x release line so existing scripts and service definitions continue to work.
-Run new commands with `tb-agent`.
-The alias will be removed in 0.6.0.
+The package installs only the `tb-agent` executable.
+Releases before 0.6.0 also installed a `tether-agent` compatibility alias.
+After upgrading from an older release, use `uv tool upgrade tb-agent` and update scripts to invoke `tb-agent`.
 
 The Codex CLI must already be installed and authenticated.
 Verify it with `codex login status` before initialization.
@@ -41,7 +41,8 @@ tb-agent init \
   --path .
 ```
 
-The CLI opens the guided Tether Brain setup page for sign-in, repository confirmation, workspace execution configuration, capability approval, model selection, and final readiness.
+The CLI opens the guided Tether Brain setup page for sign-in, repository mapping, derived workspace access, capability approval, model selection, and final readiness.
+Optional board workflow configuration is available after the installation is connected.
 For OAuth setup, the server resolves the normalized Git remote to exactly one accessible logical project, so the user does not copy a project ID.
 If the browser cannot be opened, the CLI prints the authorization URL without printing authorization codes or credentials.
 Initialization validates the Git worktree, resolves its canonical root, discovers and normalizes its remote, checks Codex authentication, registers or reuses the stored installation identity, and reports whether capability approval is pending.
@@ -93,7 +94,9 @@ tb-agent workspace add \
   --path .
 ```
 
-Generate this command from workspace Agent execution settings to include a single-use setup reference that identifies the logical project without exposing a credential.
+For OAuth profiles, the browser matches the normalized Git remote to the accessible logical projects and asks you to choose when more than one workspace uses that remote.
+Workspace access is derived from the confirmed repository instead of being selected independently.
+You can also generate this command from workspace Agent execution settings to include a single-use setup reference that identifies the logical project without exposing a credential.
 The reference expires quickly, is bound to the selected installation and workspace, and is consumed once.
 Direct `--project-id` remains available for advanced and recovery workflows.
 
@@ -215,7 +218,7 @@ Service definitions contain only the resolved `tb-agent` executable, profile nam
 They never contain a PAT or repository path.
 
 Existing systemd and LaunchAgent service identities are preserved during the executable rename.
-After upgrading, run `tb-agent service install` once to rewrite an older service definition that still invokes the deprecated alias.
+After upgrading from a release before 0.6.0, run `tb-agent service install` once to rewrite an older service definition that invokes the removed executable.
 
 ## Local security and state
 

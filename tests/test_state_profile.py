@@ -98,6 +98,56 @@ def test_state_backup_closes_every_sqlite_connection(
     assert closed == [True, True]
 
 
+def test_existing_setup_session_schema_gains_a_default_intent(tmp_path: Path) -> None:
+    state_path = tmp_path / "state/state.sqlite3"
+    state_path.parent.mkdir()
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE setup_sessions (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                session_handle TEXT NOT NULL,
+                code_verifier TEXT NOT NULL,
+                state_value TEXT NOT NULL,
+                nonce_value TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                issuer TEXT NOT NULL,
+                token_endpoint TEXT NOT NULL,
+                credential_endpoint TEXT NOT NULL,
+                activation_endpoint TEXT NOT NULL,
+                audience TEXT NOT NULL,
+                authorization_url TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO setup_sessions VALUES (
+                1, 'handle', 'verifier', 'state', 'nonce',
+                'http://127.0.0.1:49152/callback', 'https://tetherbrain.net',
+                'https://tetherbrain.net/oauth/token',
+                'https://tetherbrain.net/api/agent/setup/complete',
+                'https://tetherbrain.net/api/agent/credentials/activate',
+                'https://tetherbrain.net/api/agent/v1',
+                'https://tetherbrain.net/setup', 'tb-agent-cli',
+                '2099-01-01T00:00:00+00:00', 'login',
+                '2026-08-04T00:00:00+00:00'
+            )
+            """
+        )
+    state_path.chmod(0o600)
+    state_path.parent.chmod(0o700)
+
+    session = StateStore(state_path).setup_session()
+
+    assert session is not None
+    assert session["intent"] == "reauthorize"
+
+
 def test_profile_lock_allows_only_one_holder(tmp_path: Path) -> None:
     path = tmp_path / "profile.lock"
     first = ProfileLock(path, label="first")

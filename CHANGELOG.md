@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.6.0 - 2026-08-04
+
+### Removed
+
+- Remove the `tether-agent` console-script alias so the package installs only the canonical `tb-agent` executable.
+
+### Changed
+
+- Detect service definitions that invoke the removed executable and direct users to reinstall the service definition with `tb-agent service install`.
+- Send an explicit setup intent so the guided browser flow can distinguish initialization, reauthorization, migration, workspace addition, and workspace removal.
+- Resolve OAuth workspace additions from the current Git remote without prompting for a logical project ID.
+
 ## 0.5.0 - 2026-08-03
 
 ### Added

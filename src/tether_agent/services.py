@@ -177,8 +177,8 @@ class ServiceManager:
                 encoding="utf-8", errors="replace"
             ):
                 print(
-                    "Warning: this service still executes the deprecated tether-agent "
-                    "alias. Run 'tb-agent service install' to update it."
+                    "Warning: this service invokes the removed tether-agent executable. "
+                    "Run 'tb-agent service install' to update it before starting the service."
                 )
         command = (
             ["systemctl", "--user", "status", _systemd_name(self.paths.profile)]

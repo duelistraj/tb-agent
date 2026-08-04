@@ -1,3 +1,4 @@
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Self
@@ -86,6 +87,73 @@ def test_cli_exposes_phase_two_auth_commands_and_oauth_init_default() -> None:
     for command in ("login", "migrate", "refresh", "revoke"):
         parsed = parser.parse_args(["auth", command])
         assert parsed.auth_command == command
+
+
+def test_loopback_callback_renders_secure_html_and_returns_to_setup() -> None:
+    return_url = (
+        "https://tetherbrain.net/agent/setup?session=setup-handle"
+        "&step=repository_confirmation"
+    )
+    server = oauth_module._CallbackServer(return_url=return_url)
+    wait_thread = threading.Thread(target=server.wait, daemon=True)
+    wait_thread.start()
+
+    try:
+        response = httpx.get(
+            server.redirect_uri,
+            params={
+                "code": "tb_sac_must-not-be-rendered",
+                "iss": "https://tetherbrain.net",
+                "state": "expected-state",
+            },
+            timeout=5,
+        )
+    finally:
+        wait_thread.join(timeout=5)
+
+    assert not wait_thread.is_alive()
+    assert server.result == {
+        "code": "tb_sac_must-not-be-rendered",
+        "iss": "https://tetherbrain.net",
+        "state": "expected-state",
+    }
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["content-security-policy"] == (
+        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+        "form-action 'none'; frame-ancestors 'none'"
+    )
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert "<!doctype html>" in response.text.casefold()
+    assert "tb-agent authorization response received" in response.text
+    assert (
+        "https://tetherbrain.net/agent/setup?session=setup-handle"
+        "&amp;step=repository_confirmation"
+    ) in response.text
+    assert "tb_sac_must-not-be-rendered" not in response.text
+
+
+def test_loopback_callback_without_setup_url_renders_close_instructions() -> None:
+    server = oauth_module._CallbackServer()
+    wait_thread = threading.Thread(target=server.wait, daemon=True)
+    wait_thread.start()
+
+    try:
+        response = httpx.get(
+            server.redirect_uri,
+            params={"error": "access_denied"},
+            timeout=5,
+        )
+    finally:
+        wait_thread.join(timeout=5)
+
+    assert not wait_thread.is_alive()
+    assert server.result == {"error": "access_denied"}
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    assert "You can close this window" in response.text
+    assert "access_denied" not in response.text
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,45 @@ INSTALLATION_SCOPES = (
     "agent:execute",
     "agent:heartbeat",
 )
+CALLBACK_CONTENT_SECURITY_POLICY = (
+    "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+    "form-action 'none'; frame-ancestors 'none'"
+)
+
+
+def _callback_page(return_url: str | None) -> bytes:
+    if return_url:
+        safe_url = html.escape(return_url, quote=True)
+        refresh = f'<meta http-equiv="refresh" content="2;url={safe_url}">'
+        instructions = (
+            "<p>tb-agent is validating and securing the installation credentials. "
+            "Returning to setup&hellip;</p>"
+            f'<a class="button" href="{safe_url}">Return to setup</a>'
+        )
+    else:
+        refresh = ""
+        instructions = "<p>You can close this window and return to tb-agent.</p>"
+    return (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"{refresh}"
+        "<title>tb-agent authorization response received</title>"
+        "<style>"
+        ":root{color-scheme:dark;font-family:ui-sans-serif,system-ui,sans-serif}"
+        "body{min-height:100vh;margin:0;display:grid;place-items:center;"
+        "background:#020b09;color:#e7f0ed;padding:24px;box-sizing:border-box}"
+        "main{width:min(100%,32rem);border:1px solid #25423b;border-radius:24px;"
+        "background:#091613;padding:32px;box-sizing:border-box;box-shadow:"
+        "0 24px 80px rgba(0,0,0,.35)}"
+        "p{color:#9eb0aa;line-height:1.6}"
+        ".button{display:inline-flex;margin-top:12px;padding:12px 18px;"
+        "border-radius:14px;background:#45d6aa;color:#03120e;font-weight:700;"
+        "text-decoration:none}"
+        "</style></head><body><main>"
+        "<h1>Authorization response received</h1>"
+        f"{instructions}"
+        "</main></body></html>"
+    ).encode()
 
 
 def _random_value() -> str:
@@ -129,23 +168,13 @@ class _CallbackHandler(BaseHTTPRequestHandler):
                 ).items()
             }
             self.server.event.set()
-        return_url = self.server.return_url
-        if return_url:
-            safe_url = html.escape(return_url, quote=True)
-            body = (
-                '<!doctype html><meta charset="utf-8">'
-                f'<meta http-equiv="refresh" content="2;url={safe_url}">'
-                "<title>Tether Agent authorization received</title>"
-                "<h1>Authorization received</h1>"
-                "<p>Tether Agent is securing the installation credentials. "
-                "Returning to setup&hellip;</p>"
-                f'<p><a href="{safe_url}">Return to setup</a></p>'
-            ).encode()
-        else:
-            body = b"Tether Agent authorization received. You can close this window."
+        body = _callback_page(self.server.return_url)
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", CALLBACK_CONTENT_SECURITY_POLICY)
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

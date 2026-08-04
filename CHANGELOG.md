@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.6.1 - 2026-08-04
+
+### Fixed
+
+- Render the local OAuth callback as a secure HTML confirmation page so browsers return to guided setup instead of displaying raw markup.
+
 ## 0.6.0 - 2026-08-04
 
 ### Removed

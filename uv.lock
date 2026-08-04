@@ -710,7 +710,7 @@ wheels = [
 
 [[package]]
 name = "tb-agent"
-version = "0.6.0"
+version = "0.6.1"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

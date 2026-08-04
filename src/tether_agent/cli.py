@@ -300,7 +300,27 @@ def _reconcile_oauth_credential(*, paths: ProfilePaths, config: ProfileConfig) -
     if store.get_setting("installation_revoked") == "true":
         return "revoked"
     if credential.reauthentication_required:
-        return "reauthorize"
+        failure_code = store.get_setting("credential_failure_code")
+        if failure_code is not None:
+            return (
+                "revoked" if failure_code == "installation_revoked" else "reauthorize"
+            )
+        try:
+            asyncio.run(
+                refresh_credential(
+                    paths=paths,
+                    server_url=config.server_url,
+                    force=True,
+                    allow_reauthentication_probe=True,
+                )
+            )
+            return "valid"
+        except InstallationRevokedError:
+            return "revoked"
+        except CredentialRefreshRejected:
+            return "reauthorize"
+        except httpx.TransportError:
+            return "offline"
     try:
         if credential.access_expires_at <= datetime.now(UTC):
             asyncio.run(
@@ -376,7 +396,6 @@ def _reauthorize_existing_profile(
 
 def _replace_revoked_profile(
     *,
-    args: argparse.Namespace,
     manager: ProfileManager,
     paths: ProfilePaths,
     config: ProfileConfig,
@@ -393,18 +412,6 @@ def _replace_revoked_profile(
             "local profile and initialize it again."
         )
     _validate_preserved_mappings(config)
-    if not args.yes:
-        answer = (
-            input(
-                f"Local profile '{paths.profile}' points to a revoked installation. "
-                "Replace it with a fresh installation? [y/N]: "
-            )
-            .strip()
-            .casefold()
-        )
-        if answer not in {"y", "yes"}:
-            print("Installation replacement cancelled. No local state was changed.")
-            return 1
     validate_codex_authentication()
     result: dict = {}
     replacement_operation_id = manager.store.get_setting(
@@ -468,7 +475,6 @@ def _initialize_existing_profile(args: argparse.Namespace, paths: ProfilePaths) 
         )
     if state == "revoked":
         return _replace_revoked_profile(
-            args=args,
             manager=manager,
             paths=paths,
             config=config,
@@ -712,6 +718,10 @@ def command_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
         print(
             "Reauthentication required: "
             + ("yes" if credential.reauthentication_required else "no")
+        )
+        print(
+            "Credential terminal reason: "
+            + (store.get_setting("credential_failure_code") or "none")
         )
         print(f"Remote credential status: {remote_state}")
         print(
@@ -1060,6 +1070,8 @@ def command_auth_set_pat(args: argparse.Namespace, paths: ProfilePaths) -> int:
         manager.store.set_setting("credential_id", credential_id)
         manager.store.set_setting("authentication_required", "false")
         manager.store.set_setting("credential_revoked", "false")
+        manager.store.set_setting("installation_revoked", "false")
+        manager.store.delete_setting("credential_failure_code")
         manager.store.set_setting("last_credential_type", "pat")
 
     manager.mutate(
@@ -1090,6 +1102,18 @@ def command_auth_login(args: argparse.Namespace, paths: ProfilePaths) -> int:
     del args
     manager = ProfileManager(paths)
     config = manager.config()
+    state = _reconcile_oauth_credential(paths=paths, config=config)
+    if state == "offline":
+        raise RuntimeError(
+            "Tether Brain could not be reached. The local profile was preserved; "
+            "retry when the server is available."
+        )
+    if state == "revoked":
+        return _replace_revoked_profile(
+            manager=manager,
+            paths=paths,
+            config=config,
+        )
     result: dict = {}
 
     def login() -> None:
@@ -1306,6 +1330,10 @@ def command_auth_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
         )
         print(
             f"Reauthentication required: {'yes' if credential.reauthentication_required else 'no'}"
+        )
+        print(
+            "Credential terminal reason: "
+            + (manager.store.get_setting("credential_failure_code") or "none")
         )
     else:
         print(

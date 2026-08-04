@@ -341,6 +341,8 @@ async def _exchange_and_complete(
         store.record_registration(result["installation"])
     store.set_setting("authentication_required", "false")
     store.set_setting("credential_revoked", "false")
+    store.set_setting("installation_revoked", "false")
+    store.delete_setting("credential_failure_code")
     store.set_setting("last_credential_type", "oauth_installation")
     store.clear_setup_session()
     async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
@@ -522,6 +524,7 @@ async def refresh_credential(
     paths: ProfilePaths,
     server_url: str,
     force: bool = False,
+    allow_reauthentication_probe: bool = False,
 ) -> CredentialRecord:
     lock = ProfileLock(paths.credential_lock, label="credential refresh")
     try:
@@ -533,7 +536,9 @@ async def refresh_credential(
         current = store.credential()
         if current is None:
             raise RuntimeError("No OAuth installation credential is configured")
-        if current.revoked_at is not None or current.reauthentication_required:
+        if (
+            current.revoked_at is not None or current.reauthentication_required
+        ) and not allow_reauthentication_probe:
             raise RuntimeError("OAuth reauthentication is required")
         if store.get_setting("credential_activation_pending") == "true":
             async with httpx.AsyncClient(base_url=server_url, timeout=30) as client:
@@ -572,10 +577,9 @@ async def refresh_credential(
             if response.status_code in {401, 403}:
                 code, message = _oauth_error(response)
                 installation_revoked = code == "installation_revoked"
-                store.require_reauthentication(revoked=installation_revoked)
-                store.set_setting(
-                    "installation_revoked",
-                    "true" if installation_revoked else "false",
+                store.require_reauthentication(
+                    failure_code=code,
+                    revoked=installation_revoked,
                 )
                 error_type = (
                     InstallationRevokedError

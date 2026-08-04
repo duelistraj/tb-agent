@@ -270,6 +270,7 @@ def test_replacement_activation_clears_server_bound_state_atomically(
     run_id = uuid4()
     store.set_setting("installation_id", old_installation_id)
     store.set_setting("agent_profile_id", str(uuid4()))
+    store.set_setting("credential_failure_code", "installation_revoked")
     store.set_secret("pat", "tb_pat_old")
     store.save_claim(run_id, 1, "lease-secret")
     store.save_thread(run_id, "codex-thread-old")
@@ -295,6 +296,30 @@ def test_replacement_activation_clears_server_bound_state_atomically(
     assert credential.access_token == "tb_iat_new"
     assert store.get_setting("installation_id") == new_installation_id
     assert store.get_setting("agent_profile_id") == new_profile_id
+    assert store.get_setting("credential_failure_code") is None
     assert store.get_secret("pat") is None
     assert store.active_run_id() is None
     assert store.thread_id(run_id) is None
+
+
+def test_deleting_credentials_clears_terminal_classification(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state/state.sqlite3")
+    store.activate_installation_credential(
+        access_token="tb_iat_old",
+        refresh_token="tb_irt_old",
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+        generation=1,
+        oauth_client_id="tb-agent-cli",
+        family_id=str(uuid4()),
+    )
+    store.require_reauthentication(
+        failure_code="installation_revoked",
+        revoked=True,
+    )
+
+    store.delete_credentials()
+
+    assert store.credential() is None
+    assert store.get_setting("credential_failure_code") is None
+    assert store.get_setting("credential_revoked") == "false"
+    assert store.get_setting("installation_revoked") == "false"

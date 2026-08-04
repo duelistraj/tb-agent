@@ -48,8 +48,11 @@ If the browser cannot be opened, the CLI prints the authorization URL without pr
 Initialization validates the Git worktree, resolves its canonical root, discovers and normalizes its remote, checks Codex authentication, registers or reuses the stored installation identity, and reports whether capability approval is pending.
 Initialization never installs a background service.
 Running the same command again is safe.
-For a healthy profile it reports that the repository is already configured, and for a browser-revoked installation it offers to create a fresh installation through the same guided OAuth flow.
+For a healthy profile it reports that the repository is already configured, and for a browser-revoked installation it opens fresh-installation replacement through the same guided OAuth flow.
+The browser provides the explicit replacement approval, so the CLI does not ask for a duplicate terminal confirmation.
 The replacement keeps safe local repository and runtime settings but clears revoked credentials, leases, Codex thread state, and old server identities only after the new credential is validated.
+Profiles left in an unclassified reauthentication state by an older release perform one bounded refresh reconciliation before choosing reauthorization or replacement.
+Terminal credential failures are persisted so the daemon and later status commands do not repeatedly retry them.
 
 Use PAT fallback only when browser OAuth is unavailable or the server does not support it:
 

@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 from tether_agent.cli import (
+    _reconcile_oauth_credential,
     _RedactPatFilter,
     build_parser,
     run_cli,
@@ -18,6 +19,7 @@ from tether_agent.config import (
     load_profile_config,
     write_profile_config,
 )
+from tether_agent.oauth import InstallationRevokedError
 from tether_agent.paths import ProfilePaths
 from tether_agent.services import (
     ServiceManager,
@@ -107,8 +109,12 @@ def test_existing_revoked_profile_is_replaced_by_init_without_manual_cleanup(
     )
     monkeypatch.setattr("tether_agent.cli.validate_codex_authentication", lambda: None)
     monkeypatch.setattr("tether_agent.cli.oauth_login", login)
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: pytest.fail(f"Replacement prompted in the terminal: {prompt}"),
+    )
 
-    assert run_cli(["init", "--path", str(git_repository), "--yes"]) == 0
+    assert run_cli(["init", "--path", str(git_repository)]) == 0
 
     assert captured["intent"] == "replace"
     assert captured["replaces_installation_id"] == str(old_installation_id)
@@ -117,6 +123,111 @@ def test_existing_revoked_profile_is_replaced_by_init_without_manual_cleanup(
     output = capsys.readouterr().out
     assert "fresh installation" in output
     assert "already exists" not in output
+
+
+def test_legacy_reauthentication_state_is_probed_once_and_classified_as_revoked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    set_profile_homes(tmp_path, monkeypatch)
+    paths = ProfilePaths.resolve("default")
+    store = StateStore(paths.state_file)
+    store.activate_installation_credential(
+        access_token="tb_iat_expired",
+        refresh_token="tb_irt_recoverable",
+        expires_at=datetime.now(UTC) - timedelta(minutes=5),
+        generation=1,
+        oauth_client_id="tb-agent-cli",
+        family_id="family-legacy",
+    )
+    rotation_id = "legacy-recovery-rotation-with-entropy-123456"
+    store.prepare_credential_refresh(rotation_id)
+    store.require_reauthentication(failure_code="legacy_unclassified")
+    store.delete_setting("credential_failure_code")
+    calls: list[dict[str, object]] = []
+
+    async def refresh(**kwargs: object) -> None:
+        calls.append(kwargs)
+        store.require_reauthentication(
+            failure_code="installation_revoked",
+            revoked=True,
+        )
+        raise InstallationRevokedError(
+            "installation_revoked",
+            "Installation was revoked",
+        )
+
+    monkeypatch.setattr("tether_agent.cli.refresh_credential", refresh)
+
+    config = ProfileConfig()
+    assert _reconcile_oauth_credential(paths=paths, config=config) == "revoked"
+    assert calls == [
+        {
+            "paths": paths,
+            "server_url": config.server_url,
+            "force": True,
+            "allow_reauthentication_probe": True,
+        }
+    ]
+    assert store.credential() is not None
+    assert store.credential().recovery_rotation_id == rotation_id
+
+    monkeypatch.setattr(
+        "tether_agent.cli.refresh_credential",
+        lambda **kwargs: pytest.fail(f"Terminal credential retried: {kwargs}"),
+    )
+    assert _reconcile_oauth_credential(paths=paths, config=config) == "revoked"
+
+
+def test_auth_login_routes_a_revoked_installation_through_replacement(
+    tmp_path: Path,
+    git_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_profile_homes(tmp_path, monkeypatch)
+    paths = ProfilePaths.resolve("default")
+    old_installation_id = uuid4()
+    write_profile_config(
+        paths.config_file,
+        ProfileConfig(
+            project_mappings=[
+                ProjectMapping(
+                    project_id=uuid4(),
+                    local_path=git_repository,
+                    remote_url="ssh://git@github.com/TetherBrain/example",
+                )
+            ]
+        ),
+    )
+    StateStore(paths.state_file).set_setting(
+        "installation_id", str(old_installation_id)
+    )
+    captured: dict[str, object] = {}
+
+    async def login(**kwargs: object) -> dict:
+        captured.update(kwargs)
+        return {
+            "installation": {
+                "id": str(uuid4()),
+                "status": "pending_approval",
+            }
+        }
+
+    monkeypatch.setattr(
+        "tether_agent.cli._reconcile_oauth_credential", lambda **kwargs: "revoked"
+    )
+    monkeypatch.setattr("tether_agent.cli.validate_codex_authentication", lambda: None)
+    monkeypatch.setattr("tether_agent.cli.oauth_login", login)
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: pytest.fail(f"Replacement prompted in the terminal: {prompt}"),
+    )
+
+    assert run_cli(["auth", "login"]) == 0
+    assert captured["intent"] == "replace"
+    assert captured["replaces_installation_id"] == str(old_installation_id)
 
 
 def test_replacement_reports_an_environment_pat_that_shadows_new_oauth(

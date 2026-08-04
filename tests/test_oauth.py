@@ -498,6 +498,11 @@ async def test_refresh_distinguishes_a_revoked_installation(
         oauth_client_id="tb-agent-cli",
         family_id="family-old",
     )
+    store.prepare_credential_refresh("rotation-recovery-value-1234567890")
+    store.require_reauthentication(
+        failure_code="legacy_unclassified_failure",
+    )
+    store.delete_setting("credential_failure_code")
 
     class FakeClient:
         async def __aenter__(self) -> Self:
@@ -528,12 +533,44 @@ async def test_refresh_distinguishes_a_revoked_installation(
             paths=paths,
             server_url="https://tetherbrain.net",
             force=True,
+            allow_reauthentication_probe=True,
         )
 
     assert store.get_setting("installation_revoked") == "true"
+    assert store.get_setting("credential_failure_code") == "installation_revoked"
     credential = store.credential()
     assert credential is not None
     assert credential.reauthentication_required
+
+
+@pytest.mark.asyncio
+async def test_automatic_refresh_does_not_probe_a_terminal_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = ProfilePaths("default", tmp_path / "config", tmp_path / "state")
+    store = StateStore(paths.state_file)
+    store.activate_installation_credential(
+        access_token="tb_iat_old",
+        refresh_token="tb_irt_old",
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        generation=1,
+        oauth_client_id="tb-agent-cli",
+        family_id="family-old",
+    )
+    store.require_reauthentication(failure_code="credential_expired_or_revoked")
+    monkeypatch.setattr(
+        oauth_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: pytest.fail(f"Terminal credential contacted server: {kwargs}"),
+    )
+
+    with pytest.raises(RuntimeError, match="reauthentication is required"):
+        await refresh_credential(
+            paths=paths,
+            server_url="https://tetherbrain.net",
+            force=True,
+        )
 
 
 def test_refresh_generation_compare_and_swap_preserves_valid_state_on_fault(
@@ -563,6 +600,20 @@ def test_refresh_generation_compare_and_swap_preserves_valid_state_on_fault(
     assert credential.access_token == "tb_iat_current"
     assert credential.refresh_token == "tb_irt_current"
     assert credential.generation == 2
+
+    store.require_reauthentication(failure_code="credential_expired_or_revoked")
+    store.finish_credential_refresh(
+        expected_generation=2,
+        access_token="tb_iat_refreshed",
+        refresh_token="tb_irt_refreshed",
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+        generation=3,
+    )
+    credential = store.credential()
+    assert credential is not None
+    assert not credential.reauthentication_required
+    assert store.get_setting("credential_failure_code") is None
+    assert store.get_setting("authentication_required") == "false"
 
 
 @pytest.mark.asyncio

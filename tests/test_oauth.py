@@ -7,12 +7,15 @@ import pytest
 
 import tether_agent.oauth as oauth_module
 from tether_agent.cli import build_parser, safe_error_message
+from tether_agent.config import ProfileConfig
 from tether_agent.oauth import (
     _exchange_and_complete,
+    _oauth_login_unlocked,
     _origin,
     discover_oauth,
     pkce_pair,
 )
+from tether_agent.paths import ProfilePaths
 from tether_agent.state import StateStore
 
 
@@ -83,6 +86,98 @@ def test_cli_exposes_phase_two_auth_commands_and_oauth_init_default() -> None:
     for command in ("login", "migrate", "refresh", "revoke"):
         parsed = parser.parse_args(["auth", command])
         assert parsed.auth_command == command
+
+
+@pytest.mark.asyncio
+async def test_setup_proposal_and_resumable_state_preserve_workspace_add_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def discovery(server_url: str) -> dict[str, object]:
+        assert server_url == "https://tetherbrain.net"
+        return {
+            "issuer": "https://tetherbrain.net",
+            "token_endpoint": "https://tetherbrain.net/oauth/token",
+            "tether_agent_native_client_id": "tb-agent-cli",
+            "tether_agent_setup_endpoint": "https://tetherbrain.net/api/agent/setup",
+            "tether_agent_setup_resume_endpoint": "https://tetherbrain.net/api/agent/setup/resume",
+            "tether_agent_credential_endpoint": "https://tetherbrain.net/api/agent/setup/complete",
+            "tether_agent_credential_activation_endpoint": "https://tetherbrain.net/api/agent/credentials/activate",
+            "tether_agent_installation_audience": "https://tetherbrain.net/api/agent/v1",
+        }
+
+    class FakeCallbackServer:
+        redirect_uri = "http://127.0.0.1:49152/callback"
+        return_url = ""
+
+        def wait(self) -> dict[str, str]:
+            return {"code": "hidden"}
+
+    class FakeClient:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(self, url: str, **kwargs: object) -> httpx.Response:
+            captured["url"] = url
+            captured["proposal"] = kwargs["json"]
+            return httpx.Response(
+                200,
+                json={
+                    "session_handle": "tb_ssh_hidden",
+                    "authorization_url": "https://tetherbrain.net/setup/hidden",
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    async def complete(**kwargs: object) -> dict[str, object]:
+        captured["local_session"] = kwargs["session"]
+        return {"installation": {"status": "pending_approval"}}
+
+    monkeypatch.setattr(oauth_module, "discover_oauth", discovery)
+    monkeypatch.setattr(oauth_module, "_CallbackServer", FakeCallbackServer)
+    monkeypatch.setattr(
+        oauth_module.httpx, "AsyncClient", lambda **kwargs: FakeClient()
+    )
+    monkeypatch.setattr(oauth_module, "_open_authorization", lambda url: None)
+    monkeypatch.setattr(oauth_module, "_exchange_and_complete", complete)
+    paths = ProfilePaths(
+        profile="team",
+        config_dir=tmp_path / "config",
+        state_dir=tmp_path / "state",
+    )
+
+    result = await _oauth_login_unlocked(
+        paths=paths,
+        config=ProfileConfig(server_url="https://tetherbrain.net"),
+        intent="workspace_add",
+        repository_hints=[
+            {
+                "repository_url": "ssh://git@github.com/TetherBrain/example",
+                "access": "write",
+            }
+        ],
+    )
+
+    proposal = captured["proposal"]
+    assert isinstance(proposal, dict)
+    assert proposal["intent"] == "workspace_add"
+    assert proposal["repository_hints"] == [
+        {
+            "repository_url": "ssh://git@github.com/TetherBrain/example",
+            "access": "write",
+        }
+    ]
+    assert "local_path" not in str(proposal)
+    assert result["installation"] == {"status": "pending_approval"}
+    setup = StateStore(paths.state_file).setup_session()
+    assert setup is not None
+    assert setup["intent"] == "workspace_add"
 
 
 def test_every_installation_secret_is_redacted() -> None:

@@ -178,6 +178,7 @@ class StateStore:
                     client_id TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     mode TEXT NOT NULL,
+                    intent TEXT NOT NULL DEFAULT 'reauthorize',
                     updated_at TEXT NOT NULL
                 );
                 """
@@ -207,6 +208,10 @@ class StateStore:
             if "audience" not in setup_columns:
                 connection.execute(
                     "ALTER TABLE setup_sessions ADD COLUMN audience TEXT NOT NULL DEFAULT ''"
+                )
+            if "intent" not in setup_columns:
+                connection.execute(
+                    "ALTER TABLE setup_sessions ADD COLUMN intent TEXT NOT NULL DEFAULT 'reauthorize'"
                 )
             primary_keys = [
                 row["name"]
@@ -503,8 +508,9 @@ class StateStore:
                     singleton, session_handle, code_verifier, state_value,
                     nonce_value, redirect_uri, issuer, token_endpoint,
                     credential_endpoint, activation_endpoint, audience,
-                    authorization_url, client_id, expires_at, mode, updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    authorization_url, client_id, expires_at, mode, intent,
+                    updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     values["session_handle"],
@@ -521,6 +527,7 @@ class StateStore:
                     values["client_id"],
                     values["expires_at"],
                     values["mode"],
+                    values["intent"],
                     now,
                 ),
             )

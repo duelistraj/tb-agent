@@ -230,6 +230,134 @@ def test_workspace_add_and_remove_without_pat_rotation_or_restart(
     assert syncs == ["team", "team"]
 
 
+def test_oauth_workspace_add_resolves_project_without_prompting_for_an_id(
+    tmp_path: Path,
+    git_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from tether_agent.config import ProfileConfig, write_profile_config
+
+    set_profile_homes(tmp_path, monkeypatch)
+    paths = ProfilePaths.resolve("team")
+    write_profile_config(paths.config_file, ProfileConfig())
+    store = StateStore(paths.state_file)
+    store.activate_installation_credential(
+        access_token="tb_iat_current",
+        refresh_token="tb_irt_current",
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+        generation=1,
+        oauth_client_id="tb-agent-cli",
+        family_id=str(uuid4()),
+    )
+    project_id = uuid4()
+    captured: dict[str, object] = {}
+
+    async def login(**kwargs: object) -> dict:
+        captured.update(kwargs)
+        return {
+            "installation": {"status": "pending_approval"},
+            "resolved_projects": [
+                {
+                    "id": str(project_id),
+                    "repository_url": "https://github.com/TetherBrain/example.git",
+                }
+            ],
+        }
+
+    registrations: list[str] = []
+    monkeypatch.setattr("tether_agent.cli.oauth_login", login)
+    monkeypatch.setattr(
+        "tether_agent.cli._sync_registration",
+        lambda current: (
+            registrations.append(current.profile) or {"status": "pending_approval"}
+        ),
+    )
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: pytest.fail(f"OAuth workspace add prompted: {prompt}"),
+    )
+
+    assert (
+        run_cli(
+            [
+                "--profile",
+                "team",
+                "workspace",
+                "add",
+                "--path",
+                str(git_repository),
+            ]
+        )
+        == 0
+    )
+
+    mapping = load_profile_config(paths.config_file).project_mappings[0]
+    assert mapping.project_id == project_id
+    assert mapping.local_path == git_repository.resolve()
+    assert captured["intent"] == "workspace_add"
+    assert captured["repository_hints"] == [
+        {
+            "repository_url": "ssh://git@github.com/TetherBrain/example",
+            "access": "write",
+        }
+    ]
+    assert registrations == ["team"]
+
+
+def test_oauth_workspace_add_rejects_an_existing_remote_before_authorization(
+    tmp_path: Path,
+    git_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from tether_agent.config import ProfileConfig, ProjectMapping, write_profile_config
+
+    set_profile_homes(tmp_path, monkeypatch)
+    paths = ProfilePaths.resolve("team")
+    other_path = tmp_path / "other-checkout"
+    other_path.mkdir()
+    write_profile_config(
+        paths.config_file,
+        ProfileConfig(
+            project_mappings=[
+                ProjectMapping(
+                    project_id=uuid4(),
+                    local_path=other_path,
+                    remote_url="https://github.com/tetherbrain/example.git",
+                )
+            ]
+        ),
+    )
+    StateStore(paths.state_file).activate_installation_credential(
+        access_token="tb_iat_current",
+        refresh_token="tb_irt_current",
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+        generation=1,
+        oauth_client_id="tb-agent-cli",
+        family_id=str(uuid4()),
+    )
+    monkeypatch.setattr(
+        "tether_agent.cli.oauth_login",
+        lambda **kwargs: pytest.fail(f"OAuth started unexpectedly: {kwargs}"),
+    )
+
+    with pytest.raises(RuntimeError, match="already mapped to project"):
+        run_cli(
+            [
+                "--profile",
+                "team",
+                "workspace",
+                "add",
+                "--path",
+                str(git_repository),
+            ]
+        )
+    assert load_profile_config(paths.config_file).revision == 1
+
+
 def test_auth_set_pat_and_logout_preserve_installation_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -428,7 +556,7 @@ def test_service_management_rejects_windows_and_uses_user_systemd(
     ]
 
 
-def test_service_status_warns_when_definition_uses_deprecated_alias(
+def test_service_status_warns_when_definition_uses_removed_executable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -448,7 +576,7 @@ def test_service_status_warns_when_definition_uses_deprecated_alias(
     assert ServiceManager(paths, platform="linux").status() == 0
 
     output = capsys.readouterr().out
-    assert "deprecated tether-agent alias" in output
+    assert "removed tether-agent executable" in output
     assert "tb-agent service install" in output
 
 

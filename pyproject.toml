@@ -1,6 +1,6 @@
 [project]
 name = "tb-agent"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local execution daemon for Tether Brain agent installations"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -30,7 +30,6 @@ dependencies = [
 
 [project.scripts]
 tb-agent = "tether_agent.main:main"
-tether-agent = "tether_agent.main:deprecated_main"
 
 [project.urls]
 Homepage = "https://tetherbrain.net"

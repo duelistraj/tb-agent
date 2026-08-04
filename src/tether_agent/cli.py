@@ -314,6 +314,7 @@ def _initialize_profile(args: argparse.Namespace, paths: ProfilePaths) -> int:
                 oauth_login(
                     paths=paths,
                     config=config,
+                    intent="init",
                     repository_hints=(
                         [
                             {
@@ -500,6 +501,101 @@ def command_workspace_add(args: argparse.Namespace, paths: ProfilePaths) -> int:
             raise RuntimeError(
                 "The current Git remote does not match the browser-confirmed repository"
             )
+    if project_id is None and not args.setup_reference:
+        manager = ProfileManager(paths)
+        if manager.store.credential() is not None:
+            if repository.remote_url is None:
+                raise RuntimeError(
+                    "Browser project selection requires a Git remote. Pass "
+                    "--project-id for a repository without a remote."
+                )
+            resolved_mapping: ProjectMapping | None = None
+            oauth_result: dict | None = None
+
+            def add_resolved(config: ProfileConfig) -> ProfileConfig:
+                if any(
+                    item.local_path == repository.root
+                    for item in config.project_mappings
+                ):
+                    raise RuntimeError(
+                        f"Repository {repository.root} is already mapped"
+                    )
+                existing_remote = next(
+                    (
+                        item
+                        for item in config.project_mappings
+                        if item.remote_url is not None
+                        and git_remote_identity(item.remote_url)
+                        == git_remote_identity(repository.remote_url)
+                    ),
+                    None,
+                )
+                if existing_remote is not None:
+                    raise RuntimeError(
+                        "This Git repository is already mapped to project "
+                        f"{existing_remote.project_id}"
+                    )
+                if resolved_mapping is None:
+                    return config
+                if any(
+                    item.project_id == resolved_mapping.project_id
+                    for item in config.project_mappings
+                ):
+                    raise RuntimeError(
+                        f"Project {resolved_mapping.project_id} is already mapped"
+                    )
+                return config.model_copy(
+                    update={
+                        "project_mappings": [
+                            *config.project_mappings,
+                            resolved_mapping,
+                        ]
+                    }
+                )
+
+            def authorize_resolution() -> None:
+                nonlocal oauth_result, resolved_mapping
+                oauth_result = asyncio.run(
+                    oauth_login(
+                        paths=paths,
+                        config=manager.config(),
+                        mode="login",
+                        intent="workspace_add",
+                        repository_hints=[
+                            {
+                                "repository_url": repository.remote_url,
+                                "access": args.access,
+                            }
+                        ],
+                    )
+                )
+                matches = [
+                    item
+                    for item in oauth_result.get("resolved_projects", [])
+                    if git_remote_identity(str(item["repository_url"]))
+                    == git_remote_identity(repository.remote_url)
+                ]
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        "The browser did not confirm exactly one logical project "
+                        "for this Git remote"
+                    )
+                resolved_mapping = ProjectMapping(
+                    project_id=UUID(str(matches[0]["id"])),
+                    local_path=repository.root,
+                    access=args.access,
+                    remote_url=repository.remote_url,
+                )
+
+            manager.mutate(
+                add_resolved,
+                environment_keys=WORKSPACE_ENV_KEYS,
+                state_change=authorize_resolution,
+            )
+            registration = _sync_registration(paths)
+            _print_registration(registration)
+            _warn_environment_pat_shadow()
+            return 0
     if project_id is None:
         raw = input(
             "Logical project ID, or generate a setup command from Tether Brain "
@@ -542,7 +638,12 @@ def command_workspace_add(args: argparse.Namespace, paths: ProfilePaths) -> int:
         nonlocal oauth_result
         if manager.store.credential() is not None:
             oauth_result = asyncio.run(
-                oauth_login(paths=paths, config=proposed, mode="login")
+                oauth_login(
+                    paths=paths,
+                    config=proposed,
+                    mode="login",
+                    intent="workspace_add",
+                )
             )
 
     manager.mutate(
@@ -588,7 +689,12 @@ def command_workspace_remove(args: argparse.Namespace, paths: ProfilePaths) -> i
         nonlocal oauth_result
         if manager.store.credential() is not None:
             oauth_result = asyncio.run(
-                oauth_login(paths=paths, config=proposed, mode="login")
+                oauth_login(
+                    paths=paths,
+                    config=proposed,
+                    mode="login",
+                    intent="workspace_remove",
+                )
             )
 
     manager.mutate(
@@ -705,7 +811,14 @@ def command_auth_login(args: argparse.Namespace, paths: ProfilePaths) -> int:
 
     def login() -> None:
         nonlocal result
-        result = asyncio.run(oauth_login(paths=paths, config=config, mode="login"))
+        result = asyncio.run(
+            oauth_login(
+                paths=paths,
+                config=config,
+                mode="login",
+                intent="reauthorize",
+            )
+        )
         manager.store.delete_secret("pat")
 
     manager.mutate(
@@ -749,7 +862,14 @@ def command_auth_migrate(args: argparse.Namespace, paths: ProfilePaths) -> int:
 
     def migrate() -> None:
         nonlocal result
-        result = asyncio.run(oauth_login(paths=paths, config=config, mode="migrate"))
+        result = asyncio.run(
+            oauth_login(
+                paths=paths,
+                config=config,
+                mode="migrate",
+                intent="migrate",
+            )
+        )
         manager.store.delete_secret("pat")
 
     manager.mutate(

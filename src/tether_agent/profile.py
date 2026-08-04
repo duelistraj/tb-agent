@@ -91,11 +91,14 @@ class ProfileManager:
             state_backup = self.paths.state_dir / f".rollback-{uuid4().hex}.sqlite3"
             self.store.backup(state_backup)
             proposed = change(previous)
-            updated = proposed.model_copy(update={"revision": previous.revision + 1})
-            updated = ProfileConfig.model_validate(updated.model_dump())
             try:
                 if state_change is not None:
                     state_change()
+                    proposed = change(previous)
+                updated = proposed.model_copy(
+                    update={"revision": previous.revision + 1}
+                )
+                updated = ProfileConfig.model_validate(updated.model_dump())
                 write_profile_config(self.paths.config_file, updated)
                 self.store.set_configuration_revision(updated.revision)
                 self.store.set_daemon_status("reload_requested")

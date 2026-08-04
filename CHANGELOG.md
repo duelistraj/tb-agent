@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.7.0 - 2026-08-04
+
+### Added
+
+- Add guided replacement of browser-revoked installations through the existing `tb-agent init` command.
+- Add `profile list` and guarded `profile remove` commands for explicit local profile management.
+- Add online status reconciliation and local-only `status --offline` variants.
+
+### Changed
+
+- Make initialization idempotent for healthy profiles and route new repositories through workspace setup.
+- Distinguish a revoked installation from a credential family that only needs reauthorization.
+- Clear server-bound leases and Codex thread state atomically only after replacement credentials are validated.
+
 ## 0.6.1 - 2026-08-04
 
 ### Fixed

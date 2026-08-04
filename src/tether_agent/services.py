@@ -89,6 +89,13 @@ class ServiceManager:
                 "Run 'tb-agent run' in the foreground on Windows."
             )
 
+    def is_installed(self) -> bool:
+        if self.platform == "linux":
+            return _systemd_path(self.paths).exists()
+        if self.platform == "darwin":
+            return _launchd_path(self.paths).exists()
+        return False
+
     def install(self) -> None:
         self._supported()
         executable = _executable()

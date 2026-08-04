@@ -38,6 +38,16 @@ CALLBACK_CONTENT_SECURITY_POLICY = (
 )
 
 
+class CredentialRefreshRejected(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class InstallationRevokedError(CredentialRefreshRejected):
+    pass
+
+
 def _callback_page(return_url: str | None) -> bytes:
     if return_url:
         safe_url = html.escape(return_url, quote=True)
@@ -150,6 +160,20 @@ async def discover_oauth(server_url: str) -> dict[str, Any]:
     if not isinstance(client_id, str) or not client_id:
         raise RuntimeError("The server does not advertise a native Tether Agent client")
     return metadata
+
+
+def _oauth_error(response: httpx.Response) -> tuple[str, str]:
+    try:
+        payload = response.json()
+    except ValueError:
+        return "credential_refresh_rejected", "Credential refresh was rejected"
+    detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+    if isinstance(detail, dict):
+        return (
+            str(detail.get("code") or "credential_refresh_rejected"),
+            str(detail.get("message") or "Credential refresh was rejected"),
+        )
+    return "credential_refresh_rejected", str(detail)
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -299,25 +323,37 @@ async def _exchange_and_complete(
         if validation.get("activated"):
             raise RuntimeError("The replacement credential was activated prematurely")
     expires_at = datetime.now(UTC) + timedelta(seconds=int(result["expires_in"]))
-    store.activate_installation_credential(
-        access_token=str(result["access_token"]),
-        refresh_token=str(result["refresh_token"]),
-        expires_at=expires_at,
-        generation=int(result["generation"]),
-        oauth_client_id=session["client_id"],
-        family_id=str(result["family_id"]),
-    )
-    store.record_registration(result["installation"])
+    credential_values = {
+        "access_token": str(result["access_token"]),
+        "refresh_token": str(result["refresh_token"]),
+        "expires_at": expires_at,
+        "generation": int(result["generation"]),
+        "oauth_client_id": session["client_id"],
+        "family_id": str(result["family_id"]),
+    }
+    if session.get("intent") == "replace":
+        store.activate_replacement_credential(
+            **credential_values,
+            installation=result["installation"],
+        )
+    else:
+        store.activate_installation_credential(**credential_values)
+        store.record_registration(result["installation"])
     store.set_setting("authentication_required", "false")
     store.set_setting("credential_revoked", "false")
     store.set_setting("last_credential_type", "oauth_installation")
     store.clear_setup_session()
     async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
-        activation = await client.post(
-            session["activation_endpoint"],
-            headers={"Authorization": f"Bearer {result['access_token']}"},
-        )
-        activation.raise_for_status()
+        try:
+            activation = await client.post(
+                session["activation_endpoint"],
+                headers={"Authorization": f"Bearer {result['access_token']}"},
+            )
+            activation.raise_for_status()
+        except httpx.HTTPError:
+            store.set_setting("credential_activation_pending", "true")
+        else:
+            store.set_setting("credential_activation_pending", "false")
     return result
 
 
@@ -328,9 +364,17 @@ async def _oauth_login_unlocked(
     mode: str = "login",
     intent: str = "reauthorize",
     repository_hints: list[dict[str, str]] | None = None,
+    replaces_installation_id: str | None = None,
+    replacement_operation_id: str | None = None,
 ) -> dict[str, Any]:
     store = StateStore(paths.state_file)
     metadata = await discover_oauth(config.server_url)
+    supported_intents = metadata.get("tether_agent_setup_intents_supported") or []
+    if intent == "replace" and "replace" not in supported_intents:
+        raise RuntimeError(
+            "This Tether Brain server does not support guided installation replacement. "
+            "Update the server or remove the local profile explicitly."
+        )
     incomplete = store.setup_session()
     if (
         incomplete is not None
@@ -375,7 +419,11 @@ async def _oauth_login_unlocked(
         "nonce": nonce_value,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
-        "installation_id": store.get_setting("installation_id"),
+        "installation_id": (
+            None if intent == "replace" else store.get_setting("installation_id")
+        ),
+        "replaces_installation_id": replaces_installation_id,
+        "replacement_operation_id": replacement_operation_id,
         "installation_name": config.installation_name,
         "protocol_version": config.protocol_version,
         "daemon_version": __version__,
@@ -433,6 +481,8 @@ async def oauth_login(
     mode: str = "login",
     intent: str = "reauthorize",
     repository_hints: list[dict[str, str]] | None = None,
+    replaces_installation_id: str | None = None,
+    replacement_operation_id: str | None = None,
 ) -> dict[str, Any]:
     lock = ProfileLock(paths.credential_lock, label="OAuth credential change")
     try:
@@ -448,6 +498,8 @@ async def oauth_login(
             mode=mode,
             intent=intent,
             repository_hints=repository_hints,
+            replaces_installation_id=replaces_installation_id,
+            replacement_operation_id=replacement_operation_id,
         )
     finally:
         lock.release()
@@ -483,6 +535,14 @@ async def refresh_credential(
             raise RuntimeError("No OAuth installation credential is configured")
         if current.revoked_at is not None or current.reauthentication_required:
             raise RuntimeError("OAuth reauthentication is required")
+        if store.get_setting("credential_activation_pending") == "true":
+            async with httpx.AsyncClient(base_url=server_url, timeout=30) as client:
+                activation = await client.post(
+                    "/api/agent/v1/credentials/activate",
+                    headers={"Authorization": f"Bearer {current.access_token}"},
+                )
+                activation.raise_for_status()
+            store.set_setting("credential_activation_pending", "false")
         if not force and current.access_expires_at > datetime.now(UTC) + timedelta(
             seconds=REFRESH_EARLY_SECONDS
         ):
@@ -510,7 +570,19 @@ async def refresh_credential(
                     await asyncio.sleep(2**attempt)
             assert response is not None
             if response.status_code in {401, 403}:
-                store.require_reauthentication(revoked=True)
+                code, message = _oauth_error(response)
+                installation_revoked = code == "installation_revoked"
+                store.require_reauthentication(revoked=installation_revoked)
+                store.set_setting(
+                    "installation_revoked",
+                    "true" if installation_revoked else "false",
+                )
+                error_type = (
+                    InstallationRevokedError
+                    if installation_revoked
+                    else CredentialRefreshRejected
+                )
+                raise error_type(code, message)
             response.raise_for_status()
             payload = response.json()
             store.finish_credential_refresh(

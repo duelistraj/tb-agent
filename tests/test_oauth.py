@@ -10,11 +10,13 @@ import tether_agent.oauth as oauth_module
 from tether_agent.cli import build_parser, safe_error_message
 from tether_agent.config import ProfileConfig
 from tether_agent.oauth import (
+    InstallationRevokedError,
     _exchange_and_complete,
     _oauth_login_unlocked,
     _origin,
     discover_oauth,
     pkce_pair,
+    refresh_credential,
 )
 from tether_agent.paths import ProfilePaths
 from tether_agent.state import StateStore
@@ -248,6 +250,86 @@ async def test_setup_proposal_and_resumable_state_preserve_workspace_add_intent(
     assert setup["intent"] == "workspace_add"
 
 
+@pytest.mark.asyncio
+async def test_replacement_proposal_never_rebinds_the_revoked_installation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    replaced_id = "11111111-1111-4111-8111-111111111111"
+
+    async def discovery(server_url: str) -> dict[str, object]:
+        del server_url
+        return {
+            "issuer": "https://tetherbrain.net",
+            "token_endpoint": "https://tetherbrain.net/oauth/token",
+            "tether_agent_native_client_id": "tb-agent-cli",
+            "tether_agent_setup_endpoint": "https://tetherbrain.net/api/agent/setup",
+            "tether_agent_setup_resume_endpoint": "https://tetherbrain.net/api/agent/setup/resume",
+            "tether_agent_credential_endpoint": "https://tetherbrain.net/api/agent/setup/complete",
+            "tether_agent_credential_activation_endpoint": "https://tetherbrain.net/api/agent/credentials/activate",
+            "tether_agent_installation_audience": "https://tetherbrain.net/api/agent/v1",
+            "tether_agent_setup_intents_supported": ["replace"],
+        }
+
+    class FakeCallbackServer:
+        redirect_uri = "http://127.0.0.1:49152/callback"
+        return_url = ""
+
+        def wait(self) -> dict[str, str]:
+            return {"code": "hidden"}
+
+    class FakeClient:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(self, url: str, **kwargs: object) -> httpx.Response:
+            captured["proposal"] = kwargs["json"]
+            return httpx.Response(
+                200,
+                json={
+                    "session_handle": "tb_ssh_hidden",
+                    "authorization_url": "https://tetherbrain.net/setup/hidden",
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    async def complete(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {"installation": {"status": "pending_approval"}}
+
+    monkeypatch.setattr(oauth_module, "discover_oauth", discovery)
+    monkeypatch.setattr(oauth_module, "_CallbackServer", FakeCallbackServer)
+    monkeypatch.setattr(
+        oauth_module.httpx, "AsyncClient", lambda **kwargs: FakeClient()
+    )
+    monkeypatch.setattr(oauth_module, "_open_authorization", lambda url: None)
+    monkeypatch.setattr(oauth_module, "_exchange_and_complete", complete)
+    paths = ProfilePaths("default", tmp_path / "config", tmp_path / "state")
+    store = StateStore(paths.state_file)
+    store.set_setting("installation_id", replaced_id)
+
+    await _oauth_login_unlocked(
+        paths=paths,
+        config=ProfileConfig(server_url="https://tetherbrain.net"),
+        intent="replace",
+        replaces_installation_id=replaced_id,
+        replacement_operation_id="22222222-2222-4222-8222-222222222222",
+    )
+
+    proposal = captured["proposal"]
+    assert isinstance(proposal, dict)
+    assert proposal["installation_id"] is None
+    assert proposal["replaces_installation_id"] == replaced_id
+    assert proposal["replacement_operation_id"] == (
+        "22222222-2222-4222-8222-222222222222"
+    )
+
+
 def test_every_installation_secret_is_redacted() -> None:
     message = (
         "tb_iat_access-secret tb_irt_refresh-secret tb_sat_setup-secret "
@@ -288,6 +370,95 @@ def test_credential_activation_is_atomic_and_does_not_remove_runtime_state(
     assert store.configuration_revision() == 7
 
 
+@pytest.mark.asyncio
+async def test_activation_transport_failure_keeps_replacement_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.set_setting("installation_id", "old-installation")
+
+    class FakeClient:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(self, url: str, **kwargs: object) -> httpx.Response:
+            del kwargs
+            if url.endswith("/oauth/token"):
+                return httpx.Response(
+                    200,
+                    json={"access_token": "tb_sat_setup", "nonce": "nonce"},
+                    request=httpx.Request("POST", url),
+                )
+            if url.endswith("/complete"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": "tb_iat_new",
+                        "refresh_token": "tb_irt_new",
+                        "expires_in": 900,
+                        "generation": 1,
+                        "family_id": "family-new",
+                        "audience": "https://tetherbrain.net/api/agent/v1",
+                        "installation": {
+                            "id": "new-installation",
+                            "status": "pending_approval",
+                            "profiles": [],
+                        },
+                    },
+                    request=httpx.Request("POST", url),
+                )
+            raise httpx.ConnectError(
+                "activation interrupted", request=httpx.Request("POST", url)
+            )
+
+        async def get(self, url: str, **kwargs: object) -> httpx.Response:
+            del kwargs
+            return httpx.Response(
+                200,
+                json={
+                    "audience": "https://tetherbrain.net/api/agent/v1",
+                    "family_id": "family-new",
+                    "activated": False,
+                },
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(
+        oauth_module.httpx, "AsyncClient", lambda **kwargs: FakeClient()
+    )
+    result = await _exchange_and_complete(
+        callback={
+            "state": "state",
+            "iss": "https://tetherbrain.net",
+            "code": "tb_sac_code",
+        },
+        session={
+            "state_value": "state",
+            "issuer": "https://tetherbrain.net",
+            "token_endpoint": "https://tetherbrain.net/oauth/token",
+            "client_id": "tb-agent-cli",
+            "redirect_uri": "http://127.0.0.1:49152/callback",
+            "code_verifier": "v" * 43,
+            "nonce_value": "nonce",
+            "credential_endpoint": "https://tetherbrain.net/complete",
+            "activation_endpoint": "https://tetherbrain.net/activate",
+            "session_handle": "tb_ssh_session",
+            "audience": "https://tetherbrain.net/api/agent/v1",
+            "intent": "replace",
+        },
+        store=store,
+    )
+
+    assert result["installation"]["id"] == "new-installation"
+    assert store.get_setting("installation_id") == "new-installation"
+    assert store.get_setting("credential_activation_pending") == "true"
+    assert store.credential() is not None
+
+
 def test_refresh_recovery_survives_process_termination_before_persistence(
     tmp_path: Path,
 ) -> None:
@@ -310,6 +481,59 @@ def test_refresh_recovery_survives_process_termination_before_persistence(
     assert reopened.refresh_token == "tb_irt_old"
     assert reopened.previous_refresh_token == "tb_irt_old"
     assert reopened.recovery_rotation_id == "rotation-recovery-value-1234567890"
+
+
+@pytest.mark.asyncio
+async def test_refresh_distinguishes_a_revoked_installation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = ProfilePaths("default", tmp_path / "config", tmp_path / "state")
+    store = StateStore(paths.state_file)
+    store.activate_installation_credential(
+        access_token="tb_iat_old",
+        refresh_token="tb_irt_old",
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        generation=1,
+        oauth_client_id="tb-agent-cli",
+        family_id="family-old",
+    )
+
+    class FakeClient:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def post(self, url: str, **kwargs: object) -> httpx.Response:
+            del kwargs
+            return httpx.Response(
+                401,
+                json={
+                    "detail": {
+                        "code": "installation_revoked",
+                        "message": "Installation was revoked",
+                    }
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(
+        oauth_module.httpx, "AsyncClient", lambda **kwargs: FakeClient()
+    )
+
+    with pytest.raises(InstallationRevokedError):
+        await refresh_credential(
+            paths=paths,
+            server_url="https://tetherbrain.net",
+            force=True,
+        )
+
+    assert store.get_setting("installation_revoked") == "true"
+    credential = store.credential()
+    assert credential is not None
+    assert credential.reauthentication_required
 
 
 def test_refresh_generation_compare_and_swap_preserves_valid_state_on_fault(

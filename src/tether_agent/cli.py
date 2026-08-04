@@ -35,6 +35,8 @@ from tether_agent.config import (
 from tether_agent.daemon import AgentDaemon
 from tether_agent.locking import LockUnavailable, ProfileLock
 from tether_agent.oauth import (
+    CredentialRefreshRejected,
+    InstallationRevokedError,
     oauth_login,
     refresh_credential,
     validate_installation_credential,
@@ -239,7 +241,269 @@ def _mapping_from_arguments(args: argparse.Namespace) -> ProjectMapping | None:
     )
 
 
+def _repository_for_existing_init(
+    args: argparse.Namespace,
+    config: ProfileConfig,
+) -> tuple[object | None, ProjectMapping | None]:
+    if args.path is None:
+        return None, None
+    repository = inspect_repository(
+        args.path,
+        remote=args.remote,
+        allow_no_remote=args.allow_no_remote,
+    )
+    mapping = next(
+        (
+            item
+            for item in config.project_mappings
+            if item.local_path == repository.root
+            or item.remote_url is not None
+            and repository.remote_url is not None
+            and git_remote_identity(item.remote_url)
+            == git_remote_identity(repository.remote_url)
+        ),
+        None,
+    )
+    if mapping is not None and args.project_id not in {None, mapping.project_id}:
+        raise RuntimeError(
+            "The repository is already mapped to a different logical project"
+        )
+    return repository, mapping
+
+
+def _validate_preserved_mappings(config: ProfileConfig) -> None:
+    for mapping in config.project_mappings:
+        repository = inspect_repository(
+            mapping.local_path,
+            allow_no_remote=mapping.remote_url is None,
+        )
+        if repository.root != mapping.local_path:
+            raise RuntimeError(
+                f"Stored repository mapping is no longer canonical: {mapping.local_path}"
+            )
+        if (
+            mapping.remote_url is not None
+            and repository.remote_url is not None
+            and git_remote_identity(mapping.remote_url)
+            != git_remote_identity(repository.remote_url)
+        ):
+            raise RuntimeError(
+                "A stored repository remote changed. Remove and add the mapping again."
+            )
+
+
+def _reconcile_oauth_credential(*, paths: ProfilePaths, config: ProfileConfig) -> str:
+    store = StateStore(paths.state_file)
+    credential = store.credential()
+    if credential is None:
+        return "reauthorize"
+    if store.get_setting("installation_revoked") == "true":
+        return "revoked"
+    if credential.reauthentication_required:
+        return "reauthorize"
+    try:
+        if credential.access_expires_at <= datetime.now(UTC):
+            asyncio.run(
+                refresh_credential(
+                    paths=paths,
+                    server_url=config.server_url,
+                    force=True,
+                )
+            )
+            return "valid"
+        remote = asyncio.run(
+            validate_installation_credential(
+                server_url=config.server_url,
+                access_token=credential.access_token,
+            )
+        )
+        if remote.get("activated") is False:
+            store.set_setting("credential_activation_pending", "true")
+            asyncio.run(
+                refresh_credential(
+                    paths=paths,
+                    server_url=config.server_url,
+                )
+            )
+        return "revoked" if remote.get("revoked") else "valid"
+    except InstallationRevokedError:
+        return "revoked"
+    except CredentialRefreshRejected:
+        return "reauthorize"
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code not in {401, 403}:
+            raise
+        try:
+            asyncio.run(
+                refresh_credential(
+                    paths=paths,
+                    server_url=config.server_url,
+                    force=True,
+                )
+            )
+            return "valid"
+        except InstallationRevokedError:
+            return "revoked"
+        except CredentialRefreshRejected:
+            return "reauthorize"
+    except httpx.TransportError:
+        return "offline"
+
+
+def _reauthorize_existing_profile(
+    *, manager: ProfileManager, paths: ProfilePaths, config: ProfileConfig
+) -> dict:
+    result: dict = {}
+
+    def login() -> None:
+        nonlocal result
+        result = asyncio.run(
+            oauth_login(
+                paths=paths,
+                config=config,
+                mode="login",
+                intent="reauthorize",
+            )
+        )
+
+    manager.mutate(
+        lambda current: current,
+        environment_keys=_oauth_mutation_environment_keys(),
+        state_change=login,
+    )
+    return result
+
+
+def _replace_revoked_profile(
+    *,
+    args: argparse.Namespace,
+    manager: ProfileManager,
+    paths: ProfilePaths,
+    config: ProfileConfig,
+) -> int:
+    installation_id = manager.store.get_setting("installation_id")
+    if installation_id is None:
+        raise RuntimeError(
+            "The revoked installation identity is missing. Remove this local profile "
+            "and initialize it again."
+        )
+    if not config.project_mappings:
+        raise RuntimeError(
+            "The revoked profile has no repository mappings to preserve. Remove this "
+            "local profile and initialize it again."
+        )
+    _validate_preserved_mappings(config)
+    if not args.yes:
+        answer = (
+            input(
+                f"Local profile '{paths.profile}' points to a revoked installation. "
+                "Replace it with a fresh installation? [y/N]: "
+            )
+            .strip()
+            .casefold()
+        )
+        if answer not in {"y", "yes"}:
+            print("Installation replacement cancelled. No local state was changed.")
+            return 1
+    validate_codex_authentication()
+    result: dict = {}
+    replacement_operation_id = manager.store.get_setting(
+        "replacement_operation_id"
+    ) or str(uuid4())
+    manager.store.set_setting("replacement_operation_id", replacement_operation_id)
+
+    def replace() -> None:
+        nonlocal result
+        result = asyncio.run(
+            oauth_login(
+                paths=paths,
+                config=config,
+                mode="login",
+                intent="replace",
+                replaces_installation_id=installation_id,
+                replacement_operation_id=replacement_operation_id,
+            )
+        )
+
+    manager.mutate(
+        lambda current: current,
+        environment_keys=_oauth_mutation_environment_keys(),
+        state_change=replace,
+    )
+    _print_registration(result["installation"])
+    manager.store.delete_setting("replacement_operation_id")
+    shadowed = _warn_environment_pat_shadow()
+    print(
+        f"Local profile '{paths.profile}' now uses fresh installation "
+        f"{result['installation']['id']}."
+    )
+    if shadowed:
+        print(
+            "Replacement is stored but is not complete until the environment PAT "
+            "override is removed."
+        )
+        return 1
+    return 0
+
+
+def _initialize_existing_profile(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    if args.auth == "pat":
+        raise RuntimeError(
+            "This local profile already exists. Use 'tb-agent auth set-pat' to "
+            "switch explicitly to PAT fallback."
+        )
+    manager = ProfileManager(paths)
+    config = manager.config()
+    if args.server is not None and args.server.rstrip("/") != config.server_url:
+        raise RuntimeError(
+            f"Local profile '{paths.profile}' is configured for {config.server_url}. "
+            "Use a different --profile for another server."
+        )
+    repository, mapping = _repository_for_existing_init(args, config)
+    state = _reconcile_oauth_credential(paths=paths, config=config)
+    if state == "offline":
+        raise RuntimeError(
+            "Tether Brain could not be reached. The local profile was preserved; "
+            "retry when the server is available."
+        )
+    if state == "revoked":
+        return _replace_revoked_profile(
+            args=args,
+            manager=manager,
+            paths=paths,
+            config=config,
+        )
+    if state == "reauthorize":
+        validate_codex_authentication()
+        result = _reauthorize_existing_profile(
+            manager=manager,
+            paths=paths,
+            config=config,
+        )
+        _print_registration(result["installation"])
+    if repository is not None and mapping is None:
+        workspace_args = argparse.Namespace(
+            path=args.path,
+            project_id=args.project_id,
+            remote=args.remote,
+            allow_no_remote=args.allow_no_remote,
+            setup_reference=None,
+            access="write",
+        )
+        return command_workspace_add(workspace_args, paths)
+    print(f"Local profile: {paths.profile}")
+    if mapping is not None:
+        print(f"Repository is already mapped to logical project {mapping.project_id}.")
+    print("This local profile is already configured. No changes were needed.")
+    capability_state = manager.store.get_setting("installation_status")
+    if capability_state == "pending_approval":
+        print("Capability approval is still pending in Tether Brain.")
+    return 0
+
+
 def command_init(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    if paths.config_file.exists():
+        return _initialize_existing_profile(args, paths)
     lock = ProfileLock(paths.mutation_lock, label="profile initialization")
     try:
         lock.acquire()
@@ -288,9 +552,11 @@ def _initialize_profile(args: argparse.Namespace, paths: ProfilePaths) -> int:
         mapping = None
     else:
         mapping = _mapping_from_arguments(args)
+    server_url = args.server or "https://tetherbrain.net"
+    installation_name = args.name or "Local Codex agent"
     config = ProfileConfig(
-        server_url=args.server,
-        installation_name=args.name,
+        server_url=server_url,
+        installation_name=installation_name,
         project_mappings=[mapping] if mapping is not None else [],
     )
     store = store or StateStore(paths.state_file)
@@ -303,7 +569,7 @@ def _initialize_profile(args: argparse.Namespace, paths: ProfilePaths) -> int:
         if args.auth == "pat":
             print("PAT authentication is an advanced fallback.")
             pat = getpass.getpass("Tether Brain PAT: ")
-            identity = asyncio.run(_validate_pat(args.server, pat))
+            identity = asyncio.run(_validate_pat(server_url, pat))
             store.set_secret("pat", pat)
             store.set_setting("credential_id", str(identity["credential"]["id"]))
             store.set_setting("authentication_required", "false")
@@ -389,7 +655,6 @@ def command_run(args: argparse.Namespace, paths: ProfilePaths) -> int:
 
 
 def command_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
-    del args
     if not paths.config_file.exists():
         environment_keys = configured_environment_keys()
         if environment_keys:
@@ -407,6 +672,13 @@ def command_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
     environment_keys = configured_environment_keys()
     environment_pat = "TETHER_AGENT_ACCESS_TOKEN" in environment_keys
     credential = store.credential()
+    remote_state = "local only" if args.offline else "not checked"
+    if credential is not None and not environment_pat and not args.offline:
+        try:
+            remote_state = _reconcile_oauth_credential(paths=paths, config=config)
+        except httpx.HTTPError:
+            remote_state = "unavailable"
+        credential = store.credential()
     print(f"Profile: {paths.profile}")
     print(f"Server: {config.server_url}")
     print(f"Configuration revision: {config.revision}")
@@ -423,8 +695,10 @@ def command_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
     if credential is not None:
         validity = (
             "revoked"
-            if credential.revoked_at is not None
-            else "expired"
+            if store.get_setting("installation_revoked") == "true"
+            else "reauthentication required"
+            if credential.reauthentication_required
+            else "access token expired; refresh available"
             if credential.access_expires_at <= datetime.now(UTC)
             else "valid"
         )
@@ -438,6 +712,15 @@ def command_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
         print(
             "Reauthentication required: "
             + ("yes" if credential.reauthentication_required else "no")
+        )
+        print(f"Remote credential status: {remote_state}")
+        print(
+            "Credential activation pending: "
+            + (
+                "yes"
+                if store.get_setting("credential_activation_pending") == "true"
+                else "no"
+            )
         )
         if environment_pat:
             print("Stored OAuth credential shadowed by environment PAT: yes")
@@ -453,7 +736,7 @@ def command_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
         + (
             "revoked"
             if credential is not None
-            and credential.revoked_at is not None
+            and store.get_setting("installation_revoked") == "true"
             or store.get_setting("credential_revoked") == "true"
             else "not reported"
         )
@@ -917,22 +1200,24 @@ def command_auth_revoke(args: argparse.Namespace, paths: ProfilePaths) -> int:
     if ProfileLock.is_locked(paths.daemon_lock):
         raise RuntimeError("Stop the daemon before revoking installation credentials")
     manager = ProfileManager(paths)
-    config = manager.config()
     credential = manager.store.credential()
     if credential is None:
-        print("No OAuth installation credential is configured.")
+        if manager.store.get_setting("installation_revoked") == "true":
+            print("Installation access is already revoked.")
+        else:
+            print("No OAuth installation credential is configured.")
+        if args.purge:
+            return command_profile_remove(
+                argparse.Namespace(local_only=True, yes=True), paths
+            )
         return 0
 
     def revoke() -> None:
-        response = httpx.post(
-            f"{config.server_url}/api/agent/v1/credentials/revoke",
-            headers={"Authorization": f"Bearer {credential.access_token}"},
-            timeout=30,
-        )
-        response.raise_for_status()
+        _revoke_profile_credential(manager=manager, paths=paths)
         manager.store.delete_credentials()
         manager.store.set_setting("authentication_required", "true")
         manager.store.set_setting("credential_revoked", "true")
+        manager.store.set_setting("installation_revoked", "true")
 
     manager.mutate(
         lambda current: current,
@@ -942,15 +1227,13 @@ def command_auth_revoke(args: argparse.Namespace, paths: ProfilePaths) -> int:
     print("Installation credentials were revoked server-side and removed locally.")
     _warn_environment_pat_shadow()
     if args.purge:
-        paths.config_file.unlink(missing_ok=True)
-        for suffix in ("", "-wal", "-shm"):
-            Path(f"{paths.state_file}{suffix}").unlink(missing_ok=True)
-        print("Profile configuration and state were purged.")
+        return command_profile_remove(
+            argparse.Namespace(local_only=True, yes=True), paths
+        )
     return 0
 
 
 def command_auth_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
-    del args
     environment_pat = "TETHER_AGENT_ACCESS_TOKEN" in configured_environment_keys()
     if not paths.config_file.exists():
         if environment_pat:
@@ -961,6 +1244,16 @@ def command_auth_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
         return 1
     manager = ProfileManager(paths)
     credential = manager.store.credential()
+    remote_state = "local only" if args.offline else "not checked"
+    if credential is not None and not environment_pat and not args.offline:
+        try:
+            remote_state = _reconcile_oauth_credential(
+                paths=paths,
+                config=manager.config(),
+            )
+        except httpx.HTTPError:
+            remote_state = "unavailable"
+        credential = manager.store.credential()
     configured = (
         environment_pat
         or credential is not None
@@ -978,23 +1271,12 @@ def command_auth_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
     print(f"Authentication: {status}")
     if credential is not None:
         now = datetime.now(UTC)
-        remote_status: dict | None = None
-        if credential.access_expires_at > now and not environment_pat:
-            try:
-                remote_status = asyncio.run(
-                    validate_installation_credential(
-                        server_url=manager.config().server_url,
-                        access_token=credential.access_token,
-                    )
-                )
-            except httpx.HTTPError:
-                remote_status = None
         validity = (
-            "reauthentication required"
+            "revoked"
+            if manager.store.get_setting("installation_revoked") == "true"
+            else "reauthentication required"
             if credential.reauthentication_required
-            else "revoked"
-            if credential.revoked_at is not None
-            else "expired"
+            else "access token expired; refresh available"
             if credential.access_expires_at <= now
             else "valid"
         )
@@ -1007,14 +1289,21 @@ def command_auth_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
         print(f"Credential family: {credential.family_id}")
         revocation = (
             "revoked"
-            if credential.revoked_at
-            or remote_status is not None
-            and remote_status.get("revoked")
+            if manager.store.get_setting("installation_revoked") == "true"
             else "not revoked"
-            if remote_status is not None
+            if remote_state == "valid"
             else "not reported"
         )
         print(f"Installation revocation: {revocation}")
+        print(f"Remote credential status: {remote_state}")
+        print(
+            "Credential activation pending: "
+            + (
+                "yes"
+                if manager.store.get_setting("credential_activation_pending") == "true"
+                else "no"
+            )
+        )
         print(
             f"Reauthentication required: {'yes' if credential.reauthentication_required else 'no'}"
         )
@@ -1068,6 +1357,129 @@ def command_auth_logout(args: argparse.Namespace, paths: ProfilePaths) -> int:
     return 0
 
 
+def _revoke_profile_credential(*, manager: ProfileManager, paths: ProfilePaths) -> bool:
+    credential = manager.store.credential()
+    if credential is None:
+        return manager.store.get_setting("installation_revoked") == "true"
+    try:
+        refreshed = asyncio.run(
+            refresh_credential(
+                paths=paths,
+                server_url=manager.config().server_url,
+                force=True,
+            )
+        )
+    except InstallationRevokedError:
+        return True
+    except CredentialRefreshRejected as error:
+        raise RuntimeError(
+            "The server installation could not be revoked with the stored "
+            "credential. Revoke it in Tether Brain Connections, or rerun with "
+            "--local-only if local removal is intentional."
+        ) from error
+    response = httpx.post(
+        f"{manager.config().server_url}/api/agent/v1/credentials/revoke",
+        headers={"Authorization": f"Bearer {refreshed.access_token}"},
+        timeout=30,
+    )
+    if response.status_code in {401, 403}:
+        try:
+            asyncio.run(
+                refresh_credential(
+                    paths=paths,
+                    server_url=manager.config().server_url,
+                    force=True,
+                )
+            )
+        except InstallationRevokedError:
+            return True
+    response.raise_for_status()
+    return True
+
+
+def _remove_profile_directory(path: Path, *, profile: str) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.name != profile or path.parent.name != "profiles":
+        raise RuntimeError(f"Refusing unsafe profile removal target: {path}")
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing to remove symlinked profile directory: {path}")
+    metadata = path.stat()
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise RuntimeError(
+            f"Profile directory is not owned by the current user: {path}"
+        )
+    shutil.rmtree(path)
+
+
+def command_profile_list(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    roots = {paths.config_dir.parent, paths.state_dir.parent}
+    names: set[str] = set()
+    for root in roots:
+        if not root.exists() or root.is_symlink():
+            continue
+        names.update(
+            child.name
+            for child in root.iterdir()
+            if child.is_dir() and not child.is_symlink()
+        )
+    if not names:
+        print("No local profiles are configured.")
+        return 0
+    for name in sorted(names):
+        marker = " (default)" if name == DEFAULT_PROFILE else ""
+        print(f"{name}{marker}")
+    return 0
+
+
+def command_profile_remove(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    if not paths.config_dir.exists() and not paths.state_dir.exists():
+        print(f"Local profile '{paths.profile}' does not exist. No changes made.")
+        return 0
+    assert_mutation_not_shadowed(relevant_keys=CONFIGURATION_ENV_KEYS)
+    store = StateStore(paths.state_file) if paths.state_file.exists() else None
+    if store is not None and store.active_run_id() is not None:
+        raise RuntimeError(
+            "An execution is active. Wait for it to finish before removing this "
+            "local profile."
+        )
+    warning = (
+        " Server credentials will not be revoked."
+        if args.local_only
+        else " Server credentials will be revoked when still active."
+    )
+    if not args.yes:
+        confirmation = input(
+            f"Remove local profile '{paths.profile}' and its stored credentials?"
+            f"{warning} Type the profile name to continue: "
+        ).strip()
+        if confirmation != paths.profile:
+            print("Profile removal cancelled. No local state was changed.")
+            return 1
+    service = ServiceManager(paths)
+    if service.is_installed():
+        service.uninstall()
+    if ProfileLock.is_locked(paths.daemon_lock):
+        raise RuntimeError(
+            "The foreground daemon is still running. Stop it before removing this "
+            "local profile."
+        )
+    if not args.local_only and paths.config_file.exists() and store is not None:
+        manager = ProfileManager(paths)
+        _revoke_profile_credential(manager=manager, paths=paths)
+    unique_directories = {paths.config_dir, paths.state_dir}
+    for directory in unique_directories:
+        _remove_profile_directory(directory, profile=paths.profile)
+    print(f"Local profile '{paths.profile}' was removed.")
+    if args.local_only:
+        print(
+            "Only local files were removed. Revoke the installation in Tether Brain "
+            "Connections if it is still active."
+        )
+    return 0
+
+
 def command_service(args: argparse.Namespace, paths: ProfilePaths) -> int:
     action = args.service_command.replace("-", "_")
     if action in {"install", "start", "restart"}:
@@ -1117,18 +1529,24 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command")
 
     init = commands.add_parser("init")
-    init.add_argument("--server", default="https://tetherbrain.net")
+    init.add_argument("--server")
     init.add_argument("--path", type=Path)
     init.add_argument("--project-id", type=UUID)
     init.add_argument("--remote")
     init.add_argument("--allow-no-remote", action="store_true")
-    init.add_argument("--name", default="Local Codex agent")
+    init.add_argument("--name")
     init.add_argument("--auth", choices=("oauth", "pat"), default="oauth")
+    init.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm replacement of a revoked local installation",
+    )
     init.set_defaults(handler=command_init)
 
     run = commands.add_parser("run")
     run.set_defaults(handler=command_run)
     status = commands.add_parser("status")
+    status.add_argument("--offline", action="store_true")
     status.set_defaults(handler=command_status)
 
     migrate = commands.add_parser("migrate")
@@ -1151,11 +1569,21 @@ def build_parser() -> argparse.ArgumentParser:
     workspace_remove.add_argument("project_id", type=UUID)
     workspace_remove.set_defaults(handler=command_workspace_remove)
 
+    profile = commands.add_parser("profile")
+    profile_commands = profile.add_subparsers(dest="profile_command", required=True)
+    profile_list = profile_commands.add_parser("list")
+    profile_list.set_defaults(handler=command_profile_list)
+    profile_remove = profile_commands.add_parser("remove")
+    profile_remove.add_argument("--local-only", action="store_true")
+    profile_remove.add_argument("--yes", action="store_true")
+    profile_remove.set_defaults(handler=command_profile_remove)
+
     auth = commands.add_parser("auth")
     auth_commands = auth.add_subparsers(dest="auth_command", required=True)
     auth_set_pat = auth_commands.add_parser("set-pat")
     auth_set_pat.set_defaults(handler=command_auth_set_pat)
     auth_status = auth_commands.add_parser("status")
+    auth_status.add_argument("--offline", action="store_true")
     auth_status.set_defaults(handler=command_auth_status)
     auth_logout = auth_commands.add_parser("logout")
     auth_logout.set_defaults(handler=command_auth_logout)

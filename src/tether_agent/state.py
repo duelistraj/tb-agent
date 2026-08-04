@@ -400,6 +400,88 @@ class StateStore:
                 ),
             )
 
+    def activate_replacement_credential(
+        self,
+        *,
+        access_token: str,
+        refresh_token: str,
+        expires_at: datetime,
+        generation: int,
+        oauth_client_id: str,
+        family_id: str,
+        installation: dict,
+    ) -> None:
+        """Atomically detach revoked execution state and activate a new identity."""
+
+        now = datetime.now(UTC).isoformat()
+        profiles = installation.get("profiles") or []
+        codex_profile = next(
+            (
+                profile
+                for profile in profiles
+                if profile.get("runtime_kind") == "codex_cli"
+            ),
+            None,
+        )
+        with self.connection(immediate=True) as connection:
+            connection.execute("DELETE FROM runs")
+            connection.execute("DELETE FROM worktrees")
+            connection.execute("DELETE FROM secrets WHERE key = 'pat'")
+            connection.execute(
+                "DELETE FROM settings WHERE key IN "
+                "('agent_profile_id', 'active_run_id', 'credential_id')"
+            )
+            connection.execute(
+                """
+                INSERT INTO credentials(
+                    singleton, credential_type, generation, access_token,
+                    access_expires_at, refresh_token, oauth_client_id, family_id,
+                    last_successful_refresh, reauthentication_required, updated_at
+                ) VALUES (1, 'oauth_installation', ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    credential_type = excluded.credential_type,
+                    generation = excluded.generation,
+                    access_token = excluded.access_token,
+                    access_expires_at = excluded.access_expires_at,
+                    refresh_token = excluded.refresh_token,
+                    previous_refresh_token = NULL,
+                    recovery_rotation_id = NULL,
+                    oauth_client_id = excluded.oauth_client_id,
+                    family_id = excluded.family_id,
+                    last_successful_refresh = excluded.last_successful_refresh,
+                    revoked_at = NULL,
+                    reauthentication_required = 0,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    generation,
+                    access_token,
+                    expires_at.isoformat(),
+                    refresh_token,
+                    oauth_client_id,
+                    family_id,
+                    now,
+                    now,
+                ),
+            )
+            settings = {
+                "installation_id": str(installation["id"]),
+                "installation_status": str(installation["status"]),
+                "authentication_required": "false",
+                "credential_revoked": "false",
+                "installation_revoked": "false",
+                "last_credential_type": "oauth_installation",
+            }
+            if codex_profile is not None:
+                settings["agent_profile_id"] = str(codex_profile["id"])
+            connection.executemany(
+                """
+                INSERT INTO settings(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                settings.items(),
+            )
+
     def prepare_credential_refresh(self, rotation_id: str) -> CredentialRecord:
         with self.connection(immediate=True) as connection:
             row = connection.execute(
@@ -639,6 +721,10 @@ class StateStore:
             }
             if codex_profile is not None:
                 values["agent_profile_id"] = str(codex_profile["id"])
+            else:
+                connection.execute(
+                    "DELETE FROM settings WHERE key = 'agent_profile_id'"
+                )
             for key, value in values.items():
                 connection.execute(
                     """

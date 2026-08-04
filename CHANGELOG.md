@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.7.1 - 2026-08-04
+
+### Fixed
+
+- Reconcile legacy reauthentication state once so browser-revoked installations enter guided replacement instead of a stale reauthorization flow.
+- Preserve refresh recovery metadata while classifying installation revocation and avoid repeated retries of terminal credentials.
+- Use browser approval as the single confirmation for fresh-installation replacement.
+
 ## 0.7.0 - 2026-08-04
 
 ### Added

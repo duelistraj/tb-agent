@@ -399,6 +399,17 @@ class StateStore:
                     now,
                 ),
             )
+            connection.execute(
+                "DELETE FROM settings WHERE key = 'credential_failure_code'"
+            )
+            connection.executemany(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+                (
+                    ("authentication_required", "false"),
+                    ("credential_revoked", "false"),
+                    ("installation_revoked", "false"),
+                ),
+            )
 
     def activate_replacement_credential(
         self,
@@ -429,7 +440,8 @@ class StateStore:
             connection.execute("DELETE FROM secrets WHERE key = 'pat'")
             connection.execute(
                 "DELETE FROM settings WHERE key IN "
-                "('agent_profile_id', 'active_run_id', 'credential_id')"
+                "('agent_profile_id', 'active_run_id', 'credential_id', "
+                "'credential_failure_code')"
             )
             connection.execute(
                 """
@@ -538,6 +550,17 @@ class StateStore:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Credential generation changed during refresh")
+            connection.execute(
+                "DELETE FROM settings WHERE key = 'credential_failure_code'"
+            )
+            connection.executemany(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+                (
+                    ("authentication_required", "false"),
+                    ("credential_revoked", "false"),
+                    ("installation_revoked", "false"),
+                ),
+            )
 
     def clear_credential_recovery(self) -> None:
         with self.connection(immediate=True) as connection:
@@ -551,7 +574,9 @@ class StateStore:
                 (datetime.now(UTC).isoformat(),),
             )
 
-    def require_reauthentication(self, *, revoked: bool = False) -> None:
+    def require_reauthentication(
+        self, *, failure_code: str, revoked: bool = False
+    ) -> None:
         with self.connection(immediate=True) as connection:
             connection.execute(
                 """
@@ -567,19 +592,29 @@ class StateStore:
                     datetime.now(UTC).isoformat(),
                 ),
             )
-            connection.execute(
+            connection.executemany(
                 "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
-                ("authentication_required", "true"),
+                (
+                    ("authentication_required", "true"),
+                    ("credential_failure_code", failure_code),
+                    ("credential_revoked", "true" if revoked else "false"),
+                    ("installation_revoked", "true" if revoked else "false"),
+                ),
             )
-            if revoked:
-                connection.execute(
-                    "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
-                    ("credential_revoked", "true"),
-                )
 
     def delete_credentials(self) -> None:
         with self.connection(immediate=True) as connection:
             connection.execute("DELETE FROM credentials WHERE singleton = 1")
+            connection.execute(
+                "DELETE FROM settings WHERE key = 'credential_failure_code'"
+            )
+            connection.executemany(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+                (
+                    ("credential_revoked", "false"),
+                    ("installation_revoked", "false"),
+                ),
+            )
 
     def save_setup_session(self, values: dict[str, str]) -> None:
         now = datetime.now(UTC).isoformat()

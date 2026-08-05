@@ -19,11 +19,15 @@ from openai_codex import CodexError
 
 from tether_agent import __version__
 from tether_agent.api import AgentApiError, TetherApi
+from tether_agent.changes import refresh_snapshot_state
 from tether_agent.config import DaemonSettings, load_effective_settings
+from tether_agent.handoff import apply_accepted_snapshot
 from tether_agent.locking import LockUnavailable, ProfileLock
 from tether_agent.oauth import refresh_credential
 from tether_agent.paths import ProfilePaths
+from tether_agent.ports import PortAllocator, RunNamespace
 from tether_agent.runtime import RuntimeRegistry
+from tether_agent.snapshots import create_snapshot, head_commit
 from tether_agent.state import StateStore
 from tether_agent.worktrees import WorktreeManager
 
@@ -55,10 +59,35 @@ class AgentDaemon:
             settings=settings.runtime_adapters,
         )
         self.worktrees = WorktreeManager(settings.worktrees)
+        self.ports = PortAllocator(self.store)
         self.installation_id: UUID | None = settings.installation_id
         self.approved_manifest_digest: str | None = None
         self._last_catalog_refresh = 0.0
         self._loaded_revision = settings.config_revision
+        self._mark_legacy_dirty_worktrees()
+
+    def _mark_legacy_dirty_worktrees(self) -> None:
+        for row in self.store.worktree_rows():
+            run_id = UUID(str(row["run_id"]))
+            if self.store.change_set(run_id) is not None:
+                continue
+            path = Path(str(row["path"]))
+            repository = Path(str(row["repository_path"]))
+            if not path.exists() or not repository.exists():
+                continue
+            try:
+                dirty = self.worktrees.is_dirty(path)
+                base_commit = head_commit(path)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if dirty:
+                self.store.begin_change_set(
+                    run_id=run_id,
+                    repository_path=repository,
+                    worktree_path=path,
+                    base_commit=base_commit,
+                    legacy=True,
+                )
 
     def _api(self, settings: DaemonSettings) -> TetherApi:
         async def installation_token(force: bool) -> str:
@@ -110,6 +139,31 @@ class AgentDaemon:
         self._last_catalog_refresh = 0.0
         self._loaded_revision = revision
         self.store.set_daemon_status("reloading")
+        return True
+
+    def _reload_live_capacity_if_changed(self) -> bool:
+        if self.paths is None:
+            return False
+        revision = self.store.configuration_revision()
+        if revision <= self._loaded_revision:
+            return False
+        next_settings = load_effective_settings(self.paths, self.store)
+        current = self.settings.model_dump(
+            exclude={"max_concurrent_runs", "config_revision"}
+        )
+        proposed = next_settings.model_dump(
+            exclude={"max_concurrent_runs", "config_revision"}
+        )
+        if current != proposed:
+            return False
+        self.settings = self.settings.model_copy(
+            update={
+                "max_concurrent_runs": next_settings.max_concurrent_runs,
+                "config_revision": next_settings.config_revision,
+            }
+        )
+        self._loaded_revision = revision
+        self.store.set_daemon_status("capacity_reloaded")
         return True
 
     def _capabilities(self) -> dict[str, Any]:
@@ -178,6 +232,7 @@ class AgentDaemon:
                 "protocol_version": self.settings.protocol_version,
                 "daemon_version": __version__,
                 "configuration_revision": self.store.configuration_revision(),
+                "configured_capacity": self.settings.max_concurrent_runs,
                 "capabilities": self._capabilities(),
             }
         )
@@ -250,11 +305,29 @@ class AgentDaemon:
             self._control_plane_loop(stop_control_plane)
         )
         try:
+            active_tasks: dict[UUID, asyncio.Task[None]] = {}
+            slot_by_run: dict[UUID, int] = {}
+            recovery_attempted = False
             while True:
                 try:
-                    await self._reload_if_changed()
+                    self._reload_live_capacity_if_changed()
+                    finished_run_ids = [
+                        run_id
+                        for run_id, task in active_tasks.items()
+                        if task.done()
+                    ]
+                    for run_id in finished_run_ids:
+                        task = active_tasks.pop(run_id)
+                        slot_by_run.pop(run_id, None)
+                        try:
+                            task.result()
+                        except (CodexError, httpx.HTTPError, OSError, RuntimeError,
+                                subprocess.SubprocessError, ValueError) as exc:
+                            logger.warning("Execution %s failed: %s", run_id, exc)
+                    if not active_tasks:
+                        await self._reload_if_changed()
                     if self.store.maintenance_requested():
-                        if not await self._reconcile_idle_active_run():
+                        if active_tasks or not await self._reconcile_idle_active_runs():
                             self.store.set_daemon_status(
                                 "maintenance_waiting_for_run_recovery"
                             )
@@ -272,21 +345,59 @@ class AgentDaemon:
                             await asyncio.sleep(self.settings.poll_seconds)
                             continue
                     assert self.installation_id is not None
-                    claim = await self.api.claim(self.installation_id)
-                    if claim is None:
+                    if not recovery_attempted:
+                        await self._recover_workers(active_tasks, slot_by_run)
+                        recovery_attempted = True
+                    await self._reconcile_change_set_integrity()
+                    await self._reconcile_handoffs()
+                    await self._reconcile_terminal_resources()
+                    used_slots = set(slot_by_run.values())
+                    available_slots = [
+                        slot
+                        for slot in range(self.settings.max_concurrent_runs)
+                        if slot not in used_slots
+                    ]
+                    claimed_any = False
+                    for worker_slot in available_slots:
+                        claim = await self.api.claim(
+                            self.installation_id,
+                            worker_slot=worker_slot,
+                            configured_capacity=self.settings.max_concurrent_runs,
+                        )
+                        if claim is None:
+                            break
+                        run_id = UUID(str(claim["run"]["id"]))
+                        namespace = self.ports.allocate(
+                            run_id=run_id,
+                            worker_slot=worker_slot,
+                        )
+                        slot_by_run[run_id] = worker_slot
+                        active_tasks[run_id] = asyncio.create_task(
+                            self._execute(
+                                claim,
+                                worker_slot=worker_slot,
+                                namespace=namespace,
+                            )
+                        )
+                        claimed_any = True
+                    if not active_tasks and not claimed_any:
                         await self.api.liveness(
                             {
                                 "installation_id": str(self.installation_id),
                                 "protocol_version": self.settings.protocol_version,
                                 "daemon_version": __version__,
+                                "configured_capacity": self.settings.max_concurrent_runs,
+                                "active_run_count": 0,
                             }
                         )
                         await self._refresh_catalogs()
                         await self._reconcile_pending_results()
-                        await self._reconcile_idle_active_run()
+                        await self._reconcile_idle_active_runs()
                         await self._cleanup_worktrees()
-                    else:
-                        await self._execute(claim)
+                    elif active_tasks:
+                        self.store.set_daemon_status(
+                            f"running:{len(active_tasks)}/{self.settings.max_concurrent_runs}"
+                        )
                 except AgentApiError as exc:
                     if not exc.recoverable:
                         self.store.set_daemon_status("registration_blocked")
@@ -319,6 +430,11 @@ class AgentDaemon:
                     )
                 await asyncio.sleep(self.settings.poll_seconds)
         finally:
+            for task in locals().get("active_tasks", {}).values():
+                task.cancel()
+            for task in locals().get("active_tasks", {}).values():
+                with suppress(asyncio.CancelledError):
+                    await task
             stop_control_plane.set()
             control_plane.cancel()
             with suppress(asyncio.CancelledError):
@@ -328,12 +444,18 @@ class AgentDaemon:
             if daemon_lock is not None:
                 daemon_lock.release()
 
-    async def _execute(self, claim: dict[str, Any]) -> None:
+    async def _execute(
+        self,
+        claim: dict[str, Any],
+        *,
+        worker_slot: int = 0,
+        namespace: RunNamespace | None = None,
+    ) -> None:
         run = claim["run"]
         run_id = UUID(run["id"])
         generation = int(run["lease_generation"])
         lease_token = str(claim["lease_token"])
-        self.store.save_claim(run_id, generation, lease_token)
+        self.store.save_claim(run_id, generation, lease_token, worker_slot)
         stop_heartbeat = asyncio.Event()
         heartbeat = asyncio.create_task(
             self._heartbeat_loop(run_id, generation, lease_token, stop_heartbeat)
@@ -446,6 +568,7 @@ class AgentDaemon:
                         working_directory=directory,
                         model_id=model_id,
                         reasoning_effort=reasoning_effort,
+                        environment=(namespace.environment() if namespace else {}),
                         progress=progress,
                     )
                 )
@@ -503,9 +626,62 @@ class AgentDaemon:
                 )
                 self.store.finish_run(run_id, "failed")
                 self.store.set_worktree_state(run_id, "failed")
+                self.ports.release(run_id)
                 return
             if pending_result is None:
                 self.store.save_pending_result(run_id, result)
+            change_set = self.store.change_set(run_id)
+            if change_set is not None:
+                if change_set.state == "legacy_manual_review_required":
+                    raise RuntimeError(
+                        "Legacy dirty worktree requires manual review and cannot "
+                        "be snapshotted automatically"
+                    )
+                if change_set.state == "executing":
+                    change_set = self.store.transition_change_set(
+                        run_id,
+                        expected_states=frozenset({"executing"}),
+                        next_state="snapshotting",
+                    )
+                if change_set.state == "snapshotting":
+                    snapshot = create_snapshot(
+                        repository=change_set.repository_path,
+                        worktree=change_set.worktree_path,
+                        run_id=run_id,
+                        base_commit=change_set.base_commit,
+                    )
+                    change_set = self.store.transition_change_set(
+                        run_id,
+                        expected_states=frozenset({"snapshotting"}),
+                        next_state="snapshot_ready",
+                        values={
+                            "snapshot_commit": snapshot.commit,
+                            "snapshot_tree": snapshot.tree,
+                        },
+                    )
+                if change_set.state == "snapshot_ready":
+                    change_set = self.store.transition_change_set(
+                        run_id,
+                        expected_states=frozenset({"snapshot_ready"}),
+                        next_state="review_ready",
+                    )
+                if (
+                    change_set.state != "review_ready"
+                    or change_set.snapshot_commit is None
+                    or change_set.snapshot_tree is None
+                ):
+                    raise RuntimeError(
+                        f"Change set is not ready for review: {change_set.state}"
+                    )
+                result["change_set"] = {
+                    "snapshot_commit": change_set.snapshot_commit,
+                    "snapshot_tree": change_set.snapshot_tree,
+                    "base_commit": change_set.base_commit,
+                    "validation_revision": change_set.validation_revision,
+                    "validation_status": change_set.validation_status,
+                    "change_set_revision": change_set.change_set_revision,
+                }
+            self.store.save_pending_result(run_id, result)
             completed = await self._complete_with_retry(
                 run_id=run_id,
                 generation=generation,
@@ -516,6 +692,8 @@ class AgentDaemon:
             self.store.clear_pending_result(run_id)
             self.store.finish_run(run_id, completed["state"])
             self.store.set_worktree_state(run_id, completed["state"])
+            if completed["state"] in {"completed", "failed", "cancelled"}:
+                self.ports.release(run_id)
         finally:
             stop_heartbeat.set()
             heartbeat.cancel()
@@ -541,6 +719,7 @@ class AgentDaemon:
                     self._remote_safe(result["message"]),
                     self._remote_safe(result["outputs"]),
                     self._remote_safe(result.get("completion_note")),
+                    self._remote_safe(result.get("change_set")),
                 )
             except AgentApiError as exc:
                 if not exc.recoverable or attempt == 2:
@@ -573,11 +752,196 @@ class AgentDaemon:
                         "installation_id": str(self.installation_id),
                         "protocol_version": self.settings.protocol_version,
                         "daemon_version": __version__,
+                        "configured_capacity": self.settings.max_concurrent_runs,
+                        "active_run_count": len(self.store.active_run_ids()),
                     }
                 )
                 await self._refresh_catalogs()
             except (AgentApiError, httpx.HTTPError, OSError, RuntimeError) as exc:
                 logger.warning("Daemon background heartbeat failed: %s", exc)
+
+    async def _reconcile_handoffs(self) -> None:
+        if self.installation_id is None:
+            return
+        for remote_run in await self.api.pending_handoffs(self.installation_id):
+            run_id = UUID(str(remote_run["id"]))
+            remote_change_set = remote_run.get("change_set")
+            if not isinstance(remote_change_set, dict):
+                continue
+            binding = {
+                "run_id": str(run_id),
+                "snapshot_commit": remote_change_set["snapshot_commit"],
+                "snapshot_tree": remote_change_set["snapshot_tree"],
+                "validation_revision": remote_change_set["validation_revision"],
+                "change_set_revision": remote_change_set["change_set_revision"],
+            }
+            local = self.store.change_set(run_id)
+            if local is None:
+                logger.error("Accepted run %s has no local change set", run_id)
+                continue
+            if remote_run["state"] == "awaiting_acknowledgement":
+                reason = (remote_run.get("pending_completion") or {}).get("reason")
+                if reason != "handoff_ack_pending":
+                    continue
+                if local.state == "accepted":
+                    local = self.store.transition_change_set(
+                        run_id,
+                        expected_states=frozenset({"accepted"}),
+                        next_state="applied",
+                    )
+                await self.api.acknowledge_handoff(run_id, binding)
+                self.ports.release(run_id)
+                continue
+            if remote_run["state"] == "handoff_blocked":
+                handoff = self.store.handoff(run_id)
+                if handoff is None or handoff["state"] != "retry_requested":
+                    continue
+            if local.state == "review_ready":
+                local = self.store.accept_change_set(
+                    run_id=run_id,
+                    snapshot_commit=str(binding["snapshot_commit"]),
+                    snapshot_tree=str(binding["snapshot_tree"]),
+                    validation_revision=int(binding["validation_revision"]),
+                    change_set_revision=int(binding["change_set_revision"]),
+                )
+            if local.state != "accepted":
+                logger.error(
+                    "Accepted server handoff %s conflicts with local state %s",
+                    run_id,
+                    local.state,
+                )
+                continue
+            try:
+                if remote_run["state"] in {"accepted", "handoff_blocked"}:
+                    await self.api.start_handoff(run_id, binding)
+                result = apply_accepted_snapshot(
+                    store=self.store,
+                    change_set=local,
+                    checkout=local.repository_path,
+                )
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                await self.api.complete_handoff(
+                    run_id,
+                    {
+                        **binding,
+                        "status": "blocked",
+                        "message": self._remote_safe(str(error)),
+                    },
+                )
+                continue
+            response = await self.api.complete_handoff(
+                run_id,
+                {
+                    **binding,
+                    "status": "applied",
+                    "method": result.method,
+                    "applied_commit": result.applied_commit,
+                },
+            )
+            local = self.store.transition_change_set(
+                run_id,
+                expected_states=frozenset({"accepted"}),
+                next_state="applied",
+            )
+            if (response.get("pending_completion") or {}).get("reason") == (
+                "handoff_ack_pending"
+            ):
+                await self.api.acknowledge_handoff(run_id, binding)
+                self.ports.release(run_id)
+
+    async def _reconcile_change_set_integrity(self) -> None:
+        for record in self.store.change_sets():
+            updated = (
+                refresh_snapshot_state(self.store, record)
+                if record.state == "review_ready"
+                else record
+            )
+            if (
+                updated.state != "superseded"
+                or updated.validation_status != "snapshot_invalidated"
+            ):
+                continue
+            assert updated.snapshot_commit is not None
+            assert updated.snapshot_tree is not None
+            await self.api.supersede_change_set(
+                updated.run_id,
+                {
+                    "run_id": str(updated.run_id),
+                    "snapshot_commit": updated.snapshot_commit,
+                    "snapshot_tree": updated.snapshot_tree,
+                    "expected_change_set_revision": (
+                        updated.change_set_revision - 1
+                    ),
+                    "new_change_set_revision": updated.change_set_revision,
+                    "reason": "snapshot_invalidated",
+                },
+            )
+            self.ports.release(updated.run_id)
+
+    async def _reconcile_terminal_resources(self) -> None:
+        terminal_states = {
+            "completed",
+            "failed",
+            "cancelled",
+            "rejected",
+            "superseded",
+        }
+        for reservation in self.store.active_port_reservations():
+            remote = await self.api.run(reservation.run_id)
+            remote_state = str(remote.get("state", ""))
+            if remote_state not in terminal_states:
+                continue
+            change_set = self.store.change_set(reservation.run_id)
+            if (
+                remote_state in {"rejected", "superseded"}
+                and change_set is not None
+                and change_set.state == "review_ready"
+            ):
+                self.store.transition_change_set(
+                    reservation.run_id,
+                    expected_states=frozenset({"review_ready"}),
+                    next_state=remote_state,
+                )
+            self.store.finish_run(reservation.run_id, remote_state)
+            self.ports.release(reservation.run_id)
+
+    async def _recover_workers(
+        self,
+        active_tasks: dict[UUID, asyncio.Task[None]],
+        slot_by_run: dict[UUID, int],
+    ) -> None:
+        for row in self.store.leased_run_records():
+            run_id = UUID(str(row["run_id"]))
+            generation = int(row["lease_generation"])
+            lease_token = str(row["lease_token"])
+            worker_slot = int(row["worker_slot"] or 0)
+            if worker_slot >= self.settings.max_concurrent_runs:
+                continue
+            remote = await self.api.run(run_id)
+            expires_at = remote.get("lease_expires_at")
+            lease_active = (
+                remote.get("state") in {"claimed", "gathering_context", "running"}
+                and int(remote.get("lease_generation", 0)) == generation
+                and isinstance(expires_at, str)
+                and datetime.fromisoformat(expires_at) > datetime.now().astimezone()
+            )
+            if not lease_active:
+                self.store.finish_run(run_id, str(remote.get("state", "expired")))
+                continue
+            await self.api.heartbeat(run_id, generation, lease_token)
+            namespace = self.ports.allocate(
+                run_id=run_id,
+                worker_slot=worker_slot,
+            )
+            active_tasks[run_id] = asyncio.create_task(
+                self._execute(
+                    {"run": remote, "lease_token": lease_token},
+                    worker_slot=worker_slot,
+                    namespace=namespace,
+                )
+            )
+            slot_by_run[run_id] = worker_slot
+            logger.info("Recovered execution %s in worker slot %d", run_id, worker_slot)
 
     def _prepare_projects(
         self,
@@ -624,6 +988,29 @@ class AgentDaemon:
                     repository_path=mapping.local_path,
                     path=directory,
                 )
+                if project.get("is_primary"):
+                    existing_change_set = self.store.change_set(run_id)
+                    legacy = (
+                        existing_change_set is None
+                        and self.worktrees.is_dirty(directory)
+                    )
+                    change_set = self.store.begin_change_set(
+                        run_id=run_id,
+                        repository_path=mapping.local_path,
+                        worktree_path=directory,
+                        base_commit=(
+                            existing_change_set.base_commit
+                            if existing_change_set is not None
+                            else head_commit(directory)
+                        ),
+                        legacy=legacy,
+                    )
+                    if change_set.state == "legacy_manual_review_required":
+                        raise RuntimeError(
+                            "A dirty worktree from an older tb-agent version needs "
+                            "manual review. Use 'tb-agent changes status "
+                            f"{run_id}' to inspect it, then discard or rerun it."
+                        )
             if project.get("is_primary"):
                 primary_directory = directory
         if primary_directory is None:
@@ -750,43 +1137,39 @@ class AgentDaemon:
             self.store.clear_pending_result(run_id)
             self.store.finish_run(run_id, state)
 
-    async def _reconcile_idle_active_run(self) -> bool:
-        """Clear a claim left behind when no execution coroutine is running."""
-        run_id = self.store.active_run_id()
-        if run_id is None:
-            return True
-        try:
-            run = await self.api.run(run_id)
-        except httpx.HTTPError as exc:
-            logger.warning(
-                "Could not reconcile inactive local run %s: %s",
-                run_id,
-                exc,
-            )
-            return False
-        state = str(run.get("state", ""))
-        if not state:
-            logger.warning(
-                "Could not reconcile inactive local run %s: server omitted its state",
-                run_id,
-            )
-            return False
-        pending_result = self.store.pending_result(run_id)
-        if pending_result is not None and state not in ACKNOWLEDGED_RESULT_STATES:
+    async def _reconcile_idle_active_runs(self) -> bool:
+        """Clear claims left behind when no execution coroutine is running."""
+        reconciled = True
+        for run_id in self.store.active_run_ids():
+            try:
+                run = await self.api.run(run_id)
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "Could not reconcile inactive local run %s: %s", run_id, exc
+                )
+                reconciled = False
+                continue
+            state = str(run.get("state", ""))
+            pending_result = self.store.pending_result(run_id)
+            if not state or (
+                pending_result is not None
+                and state not in ACKNOWLEDGED_RESULT_STATES
+            ):
+                reconciled = False
+                continue
+            if pending_result is not None:
+                self.store.clear_pending_result(run_id)
+            self.store.finish_run(run_id, state)
             logger.info(
-                "Saved result for run %s is still awaiting server acknowledgement",
+                "Reconciled inactive local run %s with server state %s",
                 run_id,
+                state,
             )
-            return False
-        if pending_result is not None:
-            self.store.clear_pending_result(run_id)
-        self.store.finish_run(run_id, state)
-        logger.info(
-            "Reconciled inactive local run %s with server state %s",
-            run_id,
-            state,
-        )
-        return True
+        return reconciled
+
+    async def _reconcile_idle_active_run(self) -> bool:
+        """Compatibility wrapper for callers written before multi-run profiles."""
+        return await self._reconcile_idle_active_runs()
 
     @staticmethod
     def _directory_size(path: Path) -> int:

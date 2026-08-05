@@ -76,13 +76,23 @@ class FakeServerApi:
         del installation_id, payload
         return {}
 
-    async def claim(self, installation_id: object) -> None:
-        del installation_id
+    async def claim(
+        self,
+        installation_id: object,
+        *,
+        worker_slot: int = 0,
+        configured_capacity: int = 1,
+    ) -> None:
+        del installation_id, worker_slot, configured_capacity
         self.claim_count += 1
 
     async def liveness(self, payload: dict) -> dict:
         del payload
         return {}
+
+    async def pending_handoffs(self, installation_id: object) -> list[dict]:
+        del installation_id
+        return []
 
     async def close(self) -> None:
         return None

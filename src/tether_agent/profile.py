@@ -115,3 +115,38 @@ class ProfileManager:
             if maintenance_revision is not None:
                 self.store.clear_maintenance()
             lock.release()
+
+    def mutate_live_configuration(
+        self,
+        change: Callable[[ProfileConfig], ProfileConfig],
+        *,
+        environment_keys: frozenset[str],
+    ) -> ProfileConfig:
+        """Atomically update a setting that is safe while workers are active."""
+        assert_mutation_not_shadowed(relevant_keys=environment_keys)
+        lock = ProfileLock(self.paths.mutation_lock, label="live profile mutation")
+        try:
+            lock.acquire()
+        except LockUnavailable as error:
+            raise RuntimeError(
+                f"Another command is changing profile '{self.paths.profile}'"
+            ) from error
+        previous_bytes: bytes | None = None
+        try:
+            previous = self.config()
+            previous_bytes = self.paths.config_file.read_bytes()
+            proposed = change(previous).model_copy(
+                update={"revision": previous.revision + 1}
+            )
+            updated = ProfileConfig.model_validate(proposed.model_dump())
+            try:
+                write_profile_config(self.paths.config_file, updated)
+                self.store.set_configuration_revision(updated.revision)
+                self.store.set_daemon_status("live_reload_requested")
+            except BaseException:
+                if previous_bytes is not None:
+                    atomic_write(self.paths.config_file, previous_bytes)
+                raise
+            return updated
+        finally:
+            lock.release()

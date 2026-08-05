@@ -21,6 +21,7 @@ import httpx
 
 from tether_agent import __version__
 from tether_agent.api import TetherApi
+from tether_agent.changes import require_change_set, snapshot_diff, validate_snapshot
 from tether_agent.codex_skill import install_skill, skill_status, uninstall_skill
 from tether_agent.config import (
     MUTABLE_ENV_KEYS,
@@ -779,13 +780,173 @@ def command_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
         f"Daemon: {'running' if ProfileLock.is_locked(paths.daemon_lock) else 'stopped'}"
     )
     print(f"Daemon state: {store.get_setting('daemon_status') or 'unknown'}")
-    active_run = store.active_run_id()
-    print(f"Active execution: {active_run or 'none'}")
+    active_runs = store.active_run_ids()
+    print(f"Concurrency: {len(active_runs)}/{config.max_concurrent_runs}")
+    print(
+        "Active executions: "
+        + (", ".join(str(run_id) for run_id in active_runs) if active_runs else "none")
+    )
     print(f"Workspace mappings: {len(config.project_mappings)}")
     if environment_keys:
         print("Environment overrides: " + ", ".join(sorted(environment_keys)))
     print(f"Incomplete setup session: {_setup_session_status(store)}")
     return 0
+
+
+def command_concurrency_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    manager = ProfileManager(paths)
+    config = manager.config()
+    active_runs = manager.store.active_run_ids()
+    print(f"Configured capacity: {config.max_concurrent_runs}")
+    print(f"Active executions: {len(active_runs)}")
+    for run_id in active_runs:
+        reservation = manager.store.port_reservation(run_id)
+        suffix = (
+            f" ports {reservation.port_start}-{reservation.port_end}"
+            if reservation is not None
+            else ""
+        )
+        print(f"  {run_id}{suffix}")
+    return 0
+
+
+def command_concurrency_set(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    manager = ProfileManager(paths)
+    updated = manager.mutate_live_configuration(
+        lambda current: current.model_copy(
+            update={"max_concurrent_runs": args.capacity}
+        ),
+        environment_keys=frozenset({"TETHER_AGENT_MAX_CONCURRENT_RUNS"}),
+    )
+    active_count = len(manager.store.active_run_ids())
+    print(f"Concurrent run capacity set to {updated.max_concurrent_runs}.")
+    if active_count > updated.max_concurrent_runs:
+        print(
+            f"{active_count} runs remain active. No new run will be claimed until "
+            "the active count is below the new capacity."
+        )
+    return 0
+
+
+def command_changes_list(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    del args
+    store = StateStore(paths.state_file)
+    records = store.change_sets()
+    if not records:
+        print("No local change sets.")
+        return 0
+    for item in records:
+        item = require_change_set(store, item.run_id)
+        print(
+            f"{item.run_id}\t{item.state}\trevision {item.change_set_revision}\t"
+            f"validation {item.validation_status}"
+        )
+    return 0
+
+
+def command_changes_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    record = require_change_set(StateStore(paths.state_file), args.run_id)
+    print(f"Run: {record.run_id}")
+    print(f"State: {record.state}")
+    print(f"Base commit: {record.base_commit}")
+    print(f"Snapshot commit: {record.snapshot_commit or 'none'}")
+    print(f"Snapshot tree: {record.snapshot_tree or 'none'}")
+    print(f"Change-set revision: {record.change_set_revision}")
+    print(f"Validation revision: {record.validation_revision}")
+    print(f"Validation: {record.validation_status}")
+    if record.state == "legacy_manual_review_required":
+        print(
+            "Automatic snapshot and application are disabled. Inspect this worktree, "
+            "then discard it or rerun the task."
+        )
+    return 0
+
+
+def command_changes_diff(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    record = require_change_set(StateStore(paths.state_file), args.run_id)
+    print(snapshot_diff(record) or "No file changes.")
+    return 0
+
+
+def command_changes_test(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    store = StateStore(paths.state_file)
+    record = require_change_set(store, args.run_id)
+    command = list(args.test_command)
+    if command[:1] == ["--"]:
+        command = command[1:]
+    def report_validation(
+        *,
+        validation_revision: int,
+        validation_status: str,
+    ) -> None:
+        settings = load_effective_settings(paths)
+        daemon = AgentDaemon(settings, paths=paths)
+
+        async def report() -> None:
+            try:
+                assert record.snapshot_commit is not None
+                assert record.snapshot_tree is not None
+                await daemon.api.report_change_set_validation(
+                    record.run_id,
+                    {
+                        "run_id": str(record.run_id),
+                        "snapshot_commit": record.snapshot_commit,
+                        "snapshot_tree": record.snapshot_tree,
+                        "validation_revision": validation_revision,
+                        "change_set_revision": record.change_set_revision,
+                        "validation_status": validation_status,
+                    },
+                )
+            finally:
+                await daemon.api.close()
+
+        asyncio.run(report())
+
+    updated, log_path = validate_snapshot(
+        store=store,
+        record=record,
+        command=command,
+        on_started=lambda revision: report_validation(
+            validation_revision=revision,
+            validation_status="running",
+        ),
+    )
+    report_validation(
+        validation_revision=updated.validation_revision,
+        validation_status=updated.validation_status,
+    )
+    print(f"Validation {updated.validation_status}.")
+    print(f"Log: {log_path}")
+    return 0 if updated.validation_status == "passed" else 1
+
+
+def command_changes_apply(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    settings = load_effective_settings(paths)
+    daemon = AgentDaemon(settings, paths=paths)
+
+    async def apply_pending() -> dict:
+        try:
+            remote = await daemon.api.run(args.run_id)
+            if remote.get("state") not in {
+                "accepted",
+                "applying",
+                "handoff_blocked",
+                "awaiting_acknowledgement",
+            }:
+                raise RuntimeError(
+                    "The exact change-set revision has not been accepted in Tether Brain"
+                )
+            if remote.get("state") == "handoff_blocked":
+                daemon.store.request_handoff_retry(args.run_id)
+            await daemon._reconcile_handoffs()
+            return await daemon.api.run(args.run_id)
+        finally:
+            await daemon.api.close()
+
+    result = asyncio.run(apply_pending())
+    print(f"Handoff state: {str(result.get('state', 'unknown')).replace('_', ' ')}")
+    return 0 if result.get("state") in {"completed", "awaiting_acknowledgement"} else 1
 
 
 def command_workspace_add(args: argparse.Namespace, paths: ProfilePaths) -> int:
@@ -1599,6 +1760,34 @@ def build_parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status")
     status.add_argument("--offline", action="store_true")
     status.set_defaults(handler=command_status)
+
+    concurrency = commands.add_parser("concurrency")
+    concurrency_commands = concurrency.add_subparsers(
+        dest="concurrency_command", required=True
+    )
+    concurrency_status = concurrency_commands.add_parser("status")
+    concurrency_status.set_defaults(handler=command_concurrency_status)
+    concurrency_set = concurrency_commands.add_parser("set")
+    concurrency_set.add_argument("capacity", type=int, choices=range(1, 5))
+    concurrency_set.set_defaults(handler=command_concurrency_set)
+
+    changes = commands.add_parser("changes")
+    changes_commands = changes.add_subparsers(dest="changes_command", required=True)
+    changes_list = changes_commands.add_parser("list")
+    changes_list.set_defaults(handler=command_changes_list)
+    changes_status = changes_commands.add_parser("status")
+    changes_status.add_argument("run_id", type=UUID)
+    changes_status.set_defaults(handler=command_changes_status)
+    changes_diff = changes_commands.add_parser("diff")
+    changes_diff.add_argument("run_id", type=UUID)
+    changes_diff.set_defaults(handler=command_changes_diff)
+    changes_test = changes_commands.add_parser("test")
+    changes_test.add_argument("run_id", type=UUID)
+    changes_test.add_argument("test_command", nargs=argparse.REMAINDER)
+    changes_test.set_defaults(handler=command_changes_test)
+    changes_apply = changes_commands.add_parser("apply")
+    changes_apply.add_argument("run_id", type=UUID)
+    changes_apply.set_defaults(handler=command_changes_apply)
 
     migrate = commands.add_parser("migrate")
     migrate_commands = migrate.add_subparsers(dest="migrate_command", required=True)

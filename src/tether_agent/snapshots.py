@@ -81,10 +81,7 @@ def create_snapshot(
         return Snapshot(run_id, base_commit, existing, tree, ref)
 
     tree = tree_for_worktree(worktree)
-    message = (
-        f"Tether Brain result for run {run_id}\n\n"
-        f"Tether-Brain-Run-ID: {run_id}\n"
-    )
+    message = f"Tether Brain result for run {run_id}\n\nTether-Brain-Run-ID: {run_id}\n"
     environment = {
         **os.environ,
         "GIT_AUTHOR_NAME": "Tether Brain Agent",

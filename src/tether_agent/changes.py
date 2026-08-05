@@ -11,7 +11,9 @@ from tether_agent.snapshots import snapshot_is_current
 from tether_agent.state import ChangeSetRecord, StateStore
 
 
-def refresh_snapshot_state(store: StateStore, record: ChangeSetRecord) -> ChangeSetRecord:
+def refresh_snapshot_state(
+    store: StateStore, record: ChangeSetRecord
+) -> ChangeSetRecord:
     if (
         record.state == "review_ready"
         and record.snapshot_tree is not None

@@ -79,7 +79,9 @@ def test_snapshot_has_exact_parent_ref_tree_and_run_trailer(tmp_path: Path) -> N
 
     assert git(repository, "rev-parse", f"{snapshot.commit}^") == snapshot.base_commit
     assert git(repository, "rev-parse", snapshot.ref) == snapshot.commit
-    assert git(repository, "show", "-s", "--format=%T", snapshot.commit) == snapshot.tree
+    assert (
+        git(repository, "show", "-s", "--format=%T", snapshot.commit) == snapshot.tree
+    )
     assert f"Tether-Brain-Run-ID: {snapshot.run_id}" in git(
         repository, "show", "-s", "--format=%B", snapshot.commit
     )
@@ -210,13 +212,16 @@ def test_cherry_pick_conflict_aborts_and_restores_checkout(tmp_path: Path) -> No
         )
 
     assert head_commit(repository) == captured_head
-    assert git(
-        repository,
-        "status",
-        "--porcelain=v2",
-        "--untracked-files=all",
-        "--ignore-submodules=none",
-    ) == ""
+    assert (
+        git(
+            repository,
+            "status",
+            "--porcelain=v2",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        )
+        == ""
+    )
     assert store.handoff(record.run_id)["state"] == "blocked"
 
 

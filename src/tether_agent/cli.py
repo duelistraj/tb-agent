@@ -875,6 +875,7 @@ def command_changes_test(args: argparse.Namespace, paths: ProfilePaths) -> int:
     command = list(args.test_command)
     if command[:1] == ["--"]:
         command = command[1:]
+
     def report_validation(
         *,
         validation_revision: int,

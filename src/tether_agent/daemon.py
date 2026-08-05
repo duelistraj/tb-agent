@@ -312,17 +312,21 @@ class AgentDaemon:
                 try:
                     self._reload_live_capacity_if_changed()
                     finished_run_ids = [
-                        run_id
-                        for run_id, task in active_tasks.items()
-                        if task.done()
+                        run_id for run_id, task in active_tasks.items() if task.done()
                     ]
                     for run_id in finished_run_ids:
                         task = active_tasks.pop(run_id)
                         slot_by_run.pop(run_id, None)
                         try:
                             task.result()
-                        except (CodexError, httpx.HTTPError, OSError, RuntimeError,
-                                subprocess.SubprocessError, ValueError) as exc:
+                        except (
+                            CodexError,
+                            httpx.HTTPError,
+                            OSError,
+                            RuntimeError,
+                            subprocess.SubprocessError,
+                            ValueError,
+                        ) as exc:
                             logger.warning("Execution %s failed: %s", run_id, exc)
                     if not active_tasks:
                         await self._reload_if_changed()
@@ -869,9 +873,7 @@ class AgentDaemon:
                     "run_id": str(updated.run_id),
                     "snapshot_commit": updated.snapshot_commit,
                     "snapshot_tree": updated.snapshot_tree,
-                    "expected_change_set_revision": (
-                        updated.change_set_revision - 1
-                    ),
+                    "expected_change_set_revision": (updated.change_set_revision - 1),
                     "new_change_set_revision": updated.change_set_revision,
                     "reason": "snapshot_invalidated",
                 },
@@ -990,9 +992,8 @@ class AgentDaemon:
                 )
                 if project.get("is_primary"):
                     existing_change_set = self.store.change_set(run_id)
-                    legacy = (
-                        existing_change_set is None
-                        and self.worktrees.is_dirty(directory)
+                    legacy = existing_change_set is None and self.worktrees.is_dirty(
+                        directory
                     )
                     change_set = self.store.begin_change_set(
                         run_id=run_id,
@@ -1152,8 +1153,7 @@ class AgentDaemon:
             state = str(run.get("state", ""))
             pending_result = self.store.pending_result(run_id)
             if not state or (
-                pending_result is not None
-                and state not in ACKNOWLEDGED_RESULT_STATES
+                pending_result is not None and state not in ACKNOWLEDGED_RESULT_STATES
             ):
                 reconciled = False
                 continue

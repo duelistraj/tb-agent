@@ -29,6 +29,9 @@ from tether_agent.worktrees import WorktreeManager
 
 logger = logging.getLogger(__name__)
 CONTROL_PLANE_INTERVAL_SECONDS = 25
+ACKNOWLEDGED_RESULT_STATES = frozenset(
+    {"completion_pending", "review", "completed", "failed", "cancelled"}
+)
 FILE_URI_PATTERN = re.compile(r"\bfile://[^\s,;)}\]]+")
 ABSOLUTE_PATH_PATTERN = re.compile(
     r"(?<![\w:/])(?:~[/\\]|/|[A-Za-z]:[/\\])[^\s,;)}\]]+"
@@ -251,6 +254,12 @@ class AgentDaemon:
                 try:
                     await self._reload_if_changed()
                     if self.store.maintenance_requested():
+                        if not await self._reconcile_idle_active_run():
+                            self.store.set_daemon_status(
+                                "maintenance_waiting_for_run_recovery"
+                            )
+                            await asyncio.sleep(self.settings.poll_seconds)
+                            continue
                         self.store.acknowledge_maintenance(
                             self.store.maintenance_revision()
                         )
@@ -274,6 +283,7 @@ class AgentDaemon:
                         )
                         await self._refresh_catalogs()
                         await self._reconcile_pending_results()
+                        await self._reconcile_idle_active_run()
                         await self._cleanup_worktrees()
                     else:
                         await self._execute(claim)
@@ -724,13 +734,6 @@ class AgentDaemon:
             )
 
     async def _reconcile_pending_results(self) -> None:
-        acknowledged_states = {
-            "completion_pending",
-            "review",
-            "completed",
-            "failed",
-            "cancelled",
-        }
         for run_id in self.store.pending_result_run_ids():
             try:
                 run = await self.api.run(run_id)
@@ -742,10 +745,48 @@ class AgentDaemon:
                 )
                 continue
             state = str(run.get("state", ""))
-            if state not in acknowledged_states:
+            if state not in ACKNOWLEDGED_RESULT_STATES:
                 continue
             self.store.clear_pending_result(run_id)
             self.store.finish_run(run_id, state)
+
+    async def _reconcile_idle_active_run(self) -> bool:
+        """Clear a claim left behind when no execution coroutine is running."""
+        run_id = self.store.active_run_id()
+        if run_id is None:
+            return True
+        try:
+            run = await self.api.run(run_id)
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Could not reconcile inactive local run %s: %s",
+                run_id,
+                exc,
+            )
+            return False
+        state = str(run.get("state", ""))
+        if not state:
+            logger.warning(
+                "Could not reconcile inactive local run %s: server omitted its state",
+                run_id,
+            )
+            return False
+        pending_result = self.store.pending_result(run_id)
+        if pending_result is not None and state not in ACKNOWLEDGED_RESULT_STATES:
+            logger.info(
+                "Saved result for run %s is still awaiting server acknowledgement",
+                run_id,
+            )
+            return False
+        if pending_result is not None:
+            self.store.clear_pending_result(run_id)
+        self.store.finish_run(run_id, state)
+        logger.info(
+            "Reconciled inactive local run %s with server state %s",
+            run_id,
+            state,
+        )
+        return True
 
     @staticmethod
     def _directory_size(path: Path) -> int:

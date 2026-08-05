@@ -81,6 +81,12 @@ class StateStore:
                 self._secure_sidecars()
 
     def _secure_sidecars(self) -> None:
+        if os.name == "nt":
+            # Windows applies ACLs inherited from the private profile directory.
+            # Opening SQLite WAL sidecars independently can fail while another
+            # connection maps the shared-memory file, especially on Python 3.14.
+            validate_private_file(self.path, allow_missing=False)
+            return
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(f"{self.path}{suffix}")
             flags = os.O_RDONLY

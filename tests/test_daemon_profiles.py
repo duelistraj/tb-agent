@@ -268,3 +268,81 @@ async def test_acknowledged_completion_clears_crash_recovery_result(
 
     assert store.pending_result(run_id) is None
     assert store.leased_run_ids() == []
+
+
+@pytest.mark.asyncio
+async def test_maintenance_reconciles_stale_active_run_before_acknowledging(
+    tmp_path: Path,
+) -> None:
+    _, store, daemon = initialized_daemon(tmp_path)
+    run_id = uuid4()
+    store.save_claim(run_id, 1, "expired-lease")
+    maintenance_revision = store.request_maintenance()
+
+    class Api:
+        async def run(self, requested_run_id: object) -> dict[str, object]:
+            assert requested_run_id == run_id
+            return {"state": "failed"}
+
+        async def close(self) -> None:
+            return None
+
+    await daemon.api.close()
+    daemon.api = Api()
+
+    task = asyncio.create_task(daemon.run_forever())
+    try:
+        async with asyncio.timeout(1):
+            while store.maintenance_ack_revision() < maintenance_revision:
+                await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert store.active_run_id() is None
+    assert store.leased_run_ids() == []
+
+
+@pytest.mark.asyncio
+async def test_idle_reconciliation_preserves_unacknowledged_result(
+    tmp_path: Path,
+) -> None:
+    _, store, daemon = initialized_daemon(tmp_path)
+    run_id = uuid4()
+    result = {"status": "completed", "message": "Saved work", "outputs": []}
+    store.save_claim(run_id, 1, "expired-lease")
+    store.save_pending_result(run_id, result)
+
+    class Api:
+        async def run(self, requested_run_id: object) -> dict[str, object]:
+            assert requested_run_id == run_id
+            return {"state": "awaiting_agent"}
+
+    await daemon.api.close()
+    daemon.api = Api()
+
+    assert not await daemon._reconcile_idle_active_run()
+    assert store.active_run_id() == run_id
+    assert store.pending_result(run_id) == result
+
+
+@pytest.mark.asyncio
+async def test_idle_reconciliation_preserves_state_when_server_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    _, store, daemon = initialized_daemon(tmp_path)
+    run_id = uuid4()
+    store.save_claim(run_id, 1, "expired-lease")
+
+    class Api:
+        async def run(self, requested_run_id: object) -> dict[str, object]:
+            assert requested_run_id == run_id
+            request = httpx.Request("GET", f"https://tetherbrain.net/runs/{run_id}")
+            raise httpx.ConnectError("offline", request=request)
+
+    await daemon.api.close()
+    daemon.api = Api()
+
+    assert not await daemon._reconcile_idle_active_run()
+    assert store.active_run_id() == run_id

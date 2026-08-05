@@ -909,8 +909,7 @@ def command_workspace_add(args: argparse.Namespace, paths: ProfilePaths) -> int:
                 environment_keys=WORKSPACE_ENV_KEYS,
                 state_change=authorize_resolution,
             )
-            registration = _sync_registration(paths)
-            _print_registration(registration)
+            _sync_registration(paths)
             _warn_environment_pat_shadow()
             return 0
     if project_id is None:

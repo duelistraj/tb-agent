@@ -339,6 +339,60 @@ def test_existing_healthy_profile_init_is_an_idempotent_no_op(
     assert "No changes were needed" in capsys.readouterr().out
 
 
+def test_existing_profile_init_adds_repository_when_registration_prints_itself(
+    tmp_path: Path,
+    git_repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    set_profile_homes(tmp_path, monkeypatch)
+    paths = ProfilePaths.resolve("default")
+    write_profile_config(
+        paths.config_file,
+        ProfileConfig(server_url="https://tetherbrain.net"),
+    )
+    store = StateStore(paths.state_file)
+    store.activate_installation_credential(
+        access_token="tb_iat_current",
+        refresh_token="tb_irt_current",
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+        generation=1,
+        oauth_client_id="tb-agent-cli",
+        family_id=str(uuid4()),
+    )
+    project_id = uuid4()
+
+    async def login(**kwargs: object) -> dict:
+        del kwargs
+        return {
+            "installation": {"status": "pending_approval"},
+            "resolved_projects": [
+                {
+                    "id": str(project_id),
+                    "repository_url": "https://github.com/TetherBrain/example.git",
+                }
+            ],
+        }
+
+    registrations: list[str] = []
+    monkeypatch.setattr(
+        "tether_agent.cli._reconcile_oauth_credential", lambda **kwargs: "valid"
+    )
+    monkeypatch.setattr("tether_agent.cli.oauth_login", login)
+    monkeypatch.setattr(
+        "tether_agent.cli._sync_registration",
+        lambda current: registrations.append(current.profile),
+    )
+
+    assert run_cli(["init", "--path", str(git_repository)]) == 0
+    assert (
+        load_profile_config(paths.config_file).project_mappings[0].project_id
+        == project_id
+    )
+    assert registrations == ["default"]
+
+
 def test_profile_remove_local_only_is_explicit_and_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -570,9 +624,7 @@ def test_oauth_workspace_add_resolves_project_without_prompting_for_an_id(
     monkeypatch.setattr("tether_agent.cli.oauth_login", login)
     monkeypatch.setattr(
         "tether_agent.cli._sync_registration",
-        lambda current: (
-            registrations.append(current.profile) or {"status": "pending_approval"}
-        ),
+        lambda current: registrations.append(current.profile),
     )
     monkeypatch.setattr(
         "builtins.input",

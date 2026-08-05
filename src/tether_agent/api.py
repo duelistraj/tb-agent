@@ -7,6 +7,29 @@ from uuid import UUID
 import httpx
 
 
+class AgentApiError(httpx.HTTPStatusError):
+    """A redacted server error with retry guidance for daemon operations."""
+
+    def __init__(self, response: httpx.Response) -> None:
+        code = "agent_api_error"
+        message = f"Tether Brain returned HTTP {response.status_code}"
+        recoverable = response.status_code >= 500 or response.status_code == 429
+        try:
+            detail = response.json().get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+        if isinstance(detail, dict):
+            code = str(detail.get("code") or code)
+            message = str(detail.get("message") or message)
+            recoverable = bool(detail.get("recoverable", recoverable))
+        elif isinstance(detail, str) and detail:
+            message = detail
+        self.code = code
+        self.user_message = message
+        self.recoverable = recoverable
+        super().__init__(message, request=response.request, response=response)
+
+
 class TetherApi:
     def __init__(
         self,
@@ -78,7 +101,8 @@ class TetherApi:
         response = await self._request(
             "POST", "/api/agent/v1/installations/register", json=payload
         )
-        response.raise_for_status()
+        if response.is_error:
+            raise AgentApiError(response)
         return response.json()
 
     async def liveness(self, payload: dict[str, Any]) -> dict[str, Any]:

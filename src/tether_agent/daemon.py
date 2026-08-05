@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import re
 import subprocess
 import time
 from contextlib import suppress
@@ -27,6 +28,11 @@ from tether_agent.state import StateStore
 from tether_agent.worktrees import WorktreeManager
 
 logger = logging.getLogger(__name__)
+CONTROL_PLANE_INTERVAL_SECONDS = 25
+FILE_URI_PATTERN = re.compile(r"\bfile://[^\s,;)}\]]+")
+ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?<![\w:/])(?:~[/\\]|/|[A-Za-z]:[/\\])[^\s,;)}\]]+"
+)
 
 
 class AgentDaemon:
@@ -147,7 +153,8 @@ class AgentDaemon:
             if isinstance(item, str):
                 for local_path in replacements:
                     item = item.replace(local_path, "[local-path]")
-                return item
+                item = FILE_URI_PATTERN.sub("[local-path]", item)
+                return ABSOLUTE_PATH_PATTERN.sub("[local-path]", item)
             if isinstance(item, dict):
                 return {sanitize(key): sanitize(nested) for key, nested in item.items()}
             if isinstance(item, list):
@@ -235,6 +242,10 @@ class AgentDaemon:
             finally:
                 startup_lock.release()
         self.store.set_daemon_status("starting")
+        stop_control_plane = asyncio.Event()
+        control_plane = asyncio.create_task(
+            self._control_plane_loop(stop_control_plane)
+        )
         try:
             while True:
                 try:
@@ -262,6 +273,7 @@ class AgentDaemon:
                             }
                         )
                         await self._refresh_catalogs()
+                        await self._reconcile_pending_results()
                         await self._cleanup_worktrees()
                     else:
                         await self._execute(claim)
@@ -297,6 +309,10 @@ class AgentDaemon:
                     )
                 await asyncio.sleep(self.settings.poll_seconds)
         finally:
+            stop_control_plane.set()
+            control_plane.cancel()
+            with suppress(asyncio.CancelledError):
+                await control_plane
             self.store.set_daemon_status("stopped")
             await self.api.close()
             if daemon_lock is not None:
@@ -313,36 +329,40 @@ class AgentDaemon:
             self._heartbeat_loop(run_id, generation, lease_token, stop_heartbeat)
         )
         try:
-            try:
-                context = await self.api.context(run_id, generation, lease_token)
-            except httpx.HTTPStatusError as exc:
-                detail = self._required_mapping_error(exc)
-                if detail is None:
-                    raise
-                await self.api.comment(
-                    run_id,
-                    generation,
-                    lease_token,
-                    "blocker",
-                    self._remote_safe(detail),
-                )
-                self.store.finish_run(run_id, "blocked")
-                return
-            try:
-                directory, local_context = self._prepare_projects(
-                    context=context,
-                    run_id=run_id,
-                )
-            except RuntimeError as exc:
-                await self.api.comment(
-                    run_id,
-                    generation,
-                    lease_token,
-                    "blocker",
-                    self._remote_safe(str(exc)),
-                )
-                self.store.finish_run(run_id, "blocked")
-                return
+            pending_result = self.store.pending_result(run_id)
+            directory: Path | None = None
+            local_context: dict[str, Any] | None = None
+            if pending_result is None:
+                try:
+                    context = await self.api.context(run_id, generation, lease_token)
+                except httpx.HTTPStatusError as exc:
+                    detail = self._required_mapping_error(exc)
+                    if detail is None:
+                        raise
+                    await self.api.comment(
+                        run_id,
+                        generation,
+                        lease_token,
+                        "blocker",
+                        self._remote_safe(detail),
+                    )
+                    self.store.finish_run(run_id, "blocked")
+                    return
+                try:
+                    directory, local_context = self._prepare_projects(
+                        context=context,
+                        run_id=run_id,
+                    )
+                except RuntimeError as exc:
+                    await self.api.comment(
+                        run_id,
+                        generation,
+                        lease_token,
+                        "blocker",
+                        self._remote_safe(str(exc)),
+                    )
+                    self.store.finish_run(run_id, "blocked")
+                    return
             runtime = self.runtimes.get(str(run["runtime_kind"]))
             model_value = run.get("model_id")
             if not isinstance(model_value, str) or not model_value:
@@ -368,12 +388,30 @@ class AgentDaemon:
                 effective_reasoning_effort=reasoning_effort,
             )
             progress_number = 0
+            progress_last_sent_at = 0.0
+            progress_last_fingerprint: str | None = None
 
             async def progress(
                 message: str,
                 payload: dict[str, Any],
             ) -> None:
-                nonlocal progress_number
+                nonlocal \
+                    progress_last_fingerprint, \
+                    progress_last_sent_at, \
+                    progress_number
+                fingerprint = repr(
+                    (
+                        message,
+                        payload.get("semantic_key"),
+                        payload.get("repository_paths"),
+                    )
+                )
+                now = time.monotonic()
+                if not payload.get("milestone", False) and (
+                    fingerprint == progress_last_fingerprint
+                    or now - progress_last_sent_at < 3
+                ):
+                    return
                 progress_number += 1
                 await self.api.timeline(
                     run_id,
@@ -386,30 +424,36 @@ class AgentDaemon:
                     self._remote_safe(message),
                     self._remote_safe(payload),
                 )
+                progress_last_fingerprint = fingerprint
+                progress_last_sent_at = now
 
-            runtime_task = asyncio.create_task(
-                runtime.run(
-                    run_id=run_id,
-                    context=local_context,
-                    working_directory=directory,
-                    model_id=model_id,
-                    reasoning_effort=reasoning_effort,
-                    progress=progress,
+            if pending_result is None:
+                assert directory is not None and local_context is not None
+                runtime_task = asyncio.create_task(
+                    runtime.run(
+                        run_id=run_id,
+                        context=local_context,
+                        working_directory=directory,
+                        model_id=model_id,
+                        reasoning_effort=reasoning_effort,
+                        progress=progress,
+                    )
                 )
-            )
-            completed, _ = await asyncio.wait(
-                {runtime_task, heartbeat},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if heartbeat in completed:
-                runtime_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await runtime_task
-                heartbeat_error = heartbeat.exception()
-                if heartbeat_error is not None:
-                    raise heartbeat_error
-                raise RuntimeError("Run heartbeat stopped unexpectedly")
-            result = await runtime_task
+                completed, _ = await asyncio.wait(
+                    {runtime_task, heartbeat},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if heartbeat in completed:
+                    runtime_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await runtime_task
+                    heartbeat_error = heartbeat.exception()
+                    if heartbeat_error is not None:
+                        raise heartbeat_error
+                    raise RuntimeError("Run heartbeat stopped unexpectedly")
+                result = await runtime_task
+            else:
+                result = pending_result
             if (
                 result.get("effective_model_id") != model_id
                 or result.get("effective_reasoning_effort") != reasoning_effort
@@ -450,15 +494,16 @@ class AgentDaemon:
                 self.store.finish_run(run_id, "failed")
                 self.store.set_worktree_state(run_id, "failed")
                 return
-            completed = await self.api.complete(
-                run_id,
-                generation,
-                lease_token,
-                int(run["task_version"]),
-                self._remote_safe(result["message"]),
-                self._remote_safe(result["outputs"]),
-                self._remote_safe(result.get("completion_note")),
+            if pending_result is None:
+                self.store.save_pending_result(run_id, result)
+            completed = await self._complete_with_retry(
+                run_id=run_id,
+                generation=generation,
+                lease_token=lease_token,
+                task_version=int(run["task_version"]),
+                result=result,
             )
+            self.store.clear_pending_result(run_id)
             self.store.finish_run(run_id, completed["state"])
             self.store.set_worktree_state(run_id, completed["state"])
         finally:
@@ -466,6 +511,63 @@ class AgentDaemon:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError, httpx.HTTPError):
                 await heartbeat
+
+    async def _complete_with_retry(
+        self,
+        *,
+        run_id: UUID,
+        generation: int,
+        lease_token: str,
+        task_version: int,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        for attempt in range(3):
+            try:
+                return await self.api.complete(
+                    run_id,
+                    generation,
+                    lease_token,
+                    task_version,
+                    self._remote_safe(result["message"]),
+                    self._remote_safe(result["outputs"]),
+                    self._remote_safe(result.get("completion_note")),
+                )
+            except AgentApiError as exc:
+                if not exc.recoverable or attempt == 2:
+                    raise
+                await asyncio.sleep(2**attempt)
+            except httpx.TransportError:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(2**attempt)
+        raise RuntimeError("Completion retry loop exited unexpectedly")
+
+    async def _control_plane_loop(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop.wait(), timeout=CONTROL_PLANE_INTERVAL_SECONDS
+                )
+                continue
+            except TimeoutError:
+                pass
+            if (
+                self.installation_id is None
+                or self.approved_manifest_digest is None
+                or self.store.maintenance_requested()
+            ):
+                continue
+            try:
+                await self.api.liveness(
+                    {
+                        "installation_id": str(self.installation_id),
+                        "protocol_version": self.settings.protocol_version,
+                        "daemon_version": __version__,
+                    }
+                )
+                await self._refresh_catalogs()
+            except (AgentApiError, httpx.HTTPError, OSError, RuntimeError) as exc:
+                logger.warning("Daemon background heartbeat failed: %s", exc)
 
     def _prepare_projects(
         self,
@@ -620,6 +722,30 @@ class AgentDaemon:
                 retained_bytes,
                 self.settings.worktrees.max_total_bytes,
             )
+
+    async def _reconcile_pending_results(self) -> None:
+        acknowledged_states = {
+            "completion_pending",
+            "review",
+            "completed",
+            "failed",
+            "cancelled",
+        }
+        for run_id in self.store.pending_result_run_ids():
+            try:
+                run = await self.api.run(run_id)
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "Could not reconcile saved result for run %s: %s",
+                    run_id,
+                    exc,
+                )
+                continue
+            state = str(run.get("state", ""))
+            if state not in acknowledged_states:
+                continue
+            self.store.clear_pending_result(run_id)
+            self.store.finish_run(run_id, state)
 
     @staticmethod
     def _directory_size(path: Path) -> int:

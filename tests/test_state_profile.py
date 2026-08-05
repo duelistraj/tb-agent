@@ -63,6 +63,15 @@ def test_state_backup_preserves_identity_leases_and_threads(tmp_path: Path) -> N
     source.set_setting("agent_profile_id", str(profile_id))
     source.save_claim(run_id, 7, "lease-secret")
     source.save_thread(run_id, "codex-thread")
+    source.save_pending_result(
+        run_id,
+        {
+            "status": "completed",
+            "message": "Finished once",
+            "outputs": [],
+            "completion_note": None,
+        },
+    )
     backup = tmp_path / "backups/state.sqlite3"
     source.backup(backup)
 
@@ -74,6 +83,12 @@ def test_state_backup_preserves_identity_leases_and_threads(tmp_path: Path) -> N
     assert restored.get_setting("agent_profile_id") == str(profile_id)
     assert restored.leased_run_ids() == [run_id]
     assert restored.thread_id(run_id) == "codex-thread"
+    assert restored.pending_result(run_id) == {
+        "status": "completed",
+        "message": "Finished once",
+        "outputs": [],
+        "completion_note": None,
+    }
 
 
 def test_state_backup_closes_every_sqlite_connection(

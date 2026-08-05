@@ -20,6 +20,175 @@ from tether_agent.state import StateStore
 ProgressCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
+def _enum_value(value: Any) -> str | None:
+    raw = getattr(value, "value", value)
+    return str(raw) if raw is not None else None
+
+
+def _repository_relative_path(path: str, working_directory: Path) -> str | None:
+    candidate = Path(path)
+    try:
+        relative = (
+            candidate.resolve().relative_to(working_directory.resolve())
+            if candidate.is_absolute()
+            else candidate
+        )
+    except (OSError, ValueError):
+        return None
+    normalized = relative.as_posix()
+    if (
+        not normalized
+        or normalized.startswith(("/", "~"))
+        or ".." in normalized.split("/")
+        or ":" in normalized.split("/")[0]
+    ):
+        return None
+    return normalized
+
+
+def _item_activity(
+    item: Any,
+    *,
+    working_directory: Path,
+    completed: bool,
+) -> tuple[str, dict[str, Any]] | None:
+    value = getattr(item, "root", item)
+    item_type = _enum_value(getattr(value, "type", None))
+    if item_type == "commandExecution":
+        action_types = {
+            _enum_value(getattr(getattr(action, "root", action), "type", None))
+            for action in getattr(value, "command_actions", [])
+        }
+        inspecting = bool(action_types) and action_types.issubset(
+            {"read", "listFiles", "search"}
+        )
+        return (
+            (
+                "Repository inspection completed"
+                if completed
+                else "Codex is inspecting the repository"
+            )
+            if inspecting
+            else (
+                "Local operation completed"
+                if completed
+                else "Codex is running a local operation"
+            ),
+            {
+                "activity_category": "inspecting" if inspecting else "working",
+                "semantic_key": "repository_inspection"
+                if inspecting
+                else "local_operation",
+                "phase": "running",
+                "milestone": False,
+            },
+        )
+    if item_type == "fileChange":
+        paths = [
+            relative
+            for change in getattr(value, "changes", [])
+            if (
+                relative := _repository_relative_path(
+                    str(getattr(change, "path", "")), working_directory
+                )
+            )
+        ][:20]
+        if not paths:
+            return None
+        label = "Updated" if completed else "Editing"
+        suffix = "" if len(paths) == 1 else "s"
+        return (
+            f"{label} {len(paths)} repository file{suffix}",
+            {
+                "activity_category": "editing",
+                "semantic_key": "files_updated" if completed else "editing_files",
+                "phase": "running",
+                "repository_paths": paths,
+                "milestone": completed,
+            },
+        )
+    if item_type == "webSearch":
+        return (
+            "Reference research completed"
+            if completed
+            else "Codex is researching references",
+            {
+                "activity_category": "researching",
+                "semantic_key": "reference_research",
+                "phase": "running",
+                "milestone": False,
+            },
+        )
+    if item_type in {"mcpToolCall", "dynamicToolCall"}:
+        return (
+            "Integration step completed"
+            if completed
+            else "Codex is using an integration",
+            {
+                "activity_category": "integrating",
+                "semantic_key": "integration",
+                "phase": "running",
+                "milestone": False,
+            },
+        )
+    if item_type in {"collabAgentToolCall", "subAgentActivity"}:
+        return (
+            "Delegated work completed"
+            if completed
+            else "Codex is coordinating delegated work",
+            {
+                "activity_category": "integrating",
+                "semantic_key": "delegated_work",
+                "phase": "running",
+                "milestone": False,
+            },
+        )
+    if item_type == "imageView":
+        path = _repository_relative_path(
+            str(getattr(value, "path", "")), working_directory
+        )
+        return (
+            "Repository image inspected"
+            if completed
+            else "Codex is inspecting a repository image",
+            {
+                "activity_category": "inspecting",
+                "semantic_key": "image_inspection",
+                "phase": "running",
+                "repository_paths": [path] if path else [],
+                "milestone": False,
+            },
+        )
+    if item_type == "contextCompaction":
+        return (
+            "Codex is organizing the working context",
+            {
+                "activity_category": "compacting",
+                "semantic_key": "context_compaction",
+                "phase": "running",
+                "milestone": False,
+            },
+        )
+    return None
+
+
+def _final_response_from_items(items: list[Any]) -> str | None:
+    fallback: str | None = None
+    for item in reversed(items):
+        value = getattr(item, "root", item)
+        if _enum_value(getattr(value, "type", None)) != "agentMessage":
+            continue
+        text = getattr(value, "text", None)
+        if not isinstance(text, str):
+            continue
+        phase = _enum_value(getattr(value, "phase", None))
+        if phase == "final_answer":
+            return text
+        if phase is None and fallback is None:
+            fallback = text
+    return fallback
+
+
 class RuntimeAdapter(Protocol):
     runtime_kind: str
 
@@ -214,7 +383,12 @@ class CodexRuntime:
         prompt = self._prompt(context)
         await progress(
             "Codex is preparing the local workspace",
-            {"semantic_key": "runtime_preparing", "phase": "preparing"},
+            {
+                "activity_category": "preparing",
+                "semantic_key": "runtime_preparing",
+                "phase": "preparing",
+                "milestone": True,
+            },
         )
         async with AsyncCodex() as codex:
             saved_thread_id = self.store.thread_id(run_id)
@@ -231,21 +405,88 @@ class CodexRuntime:
                     developer_instructions=(
                         "Use only the context in this request and files under the "
                         "provided local working directory. Do not search "
-                        "for or ingest unrelated Tether Brain workspace content."
+                        "for or ingest unrelated Tether Brain workspace content. "
+                        "Before changing files, check whether a missing user decision "
+                        "would materially change the result and cannot be discovered "
+                        "from the task, comments, or repository. If so, stop before "
+                        "editing and return one precise question."
                     ),
                 )
                 self.store.save_thread(run_id, thread.id)
             await progress(
                 "Codex is working",
-                {"semantic_key": "runtime_working", "phase": "running"},
+                {
+                    "activity_category": "working",
+                    "semantic_key": "runtime_working",
+                    "phase": "running",
+                    "milestone": False,
+                },
             )
-            result = await thread.run(
+            turn = await thread.turn(
                 prompt,
                 model=model_id,
                 effort=reasoning_effort,
                 output_schema=RESULT_SCHEMA,
             )
-        if result.final_response is None:
+            items: list[Any] = []
+            turn_error: str | None = None
+            async for notification in turn.stream():
+                payload = notification.payload
+                if notification.method in {"item/started", "item/completed"}:
+                    item = getattr(payload, "item", None)
+                    if item is not None:
+                        if notification.method == "item/completed":
+                            items.append(item)
+                        activity = _item_activity(
+                            item,
+                            working_directory=working_directory,
+                            completed=notification.method == "item/completed",
+                        )
+                        if activity is not None:
+                            await progress(*activity)
+                elif notification.method == "turn/plan/updated":
+                    plan = getattr(payload, "plan", [])
+                    current = next(
+                        (
+                            getattr(step, "step", None)
+                            for step in plan
+                            if _enum_value(getattr(step, "status", None))
+                            == "inProgress"
+                        ),
+                        None,
+                    )
+                    if isinstance(current, str) and current.strip():
+                        await progress(
+                            current.strip(),
+                            {
+                                "activity_category": "planning",
+                                "semantic_key": "plan_step",
+                                "phase": "running",
+                                "milestone": True,
+                            },
+                        )
+                elif notification.method == "context/compacted":
+                    await progress(
+                        "Codex is organizing the working context",
+                        {
+                            "activity_category": "compacting",
+                            "semantic_key": "context_compaction",
+                            "phase": "running",
+                            "milestone": False,
+                        },
+                    )
+                elif notification.method == "turn/completed":
+                    completed_turn = getattr(payload, "turn", None)
+                    status_value = _enum_value(getattr(completed_turn, "status", None))
+                    if status_value == "failed":
+                        error = getattr(completed_turn, "error", None)
+                        turn_error = str(
+                            getattr(error, "message", None) or "Codex turn failed"
+                        )
+            if turn_error is not None:
+                raise RuntimeError(turn_error)
+            final_response = _final_response_from_items(items)
+        if final_response is None:
             return {
                 "status": "failed",
                 "message": "Codex returned no final response",
@@ -255,7 +496,16 @@ class CodexRuntime:
                 "effective_reasoning_effort": reasoning_effort,
             }
         try:
-            parsed = _parse_result(result.final_response)
+            await progress(
+                "Codex finished local work and is saving the result",
+                {
+                    "activity_category": "finalizing",
+                    "semantic_key": "finalizing_result",
+                    "phase": "finalizing",
+                    "milestone": True,
+                },
+            )
+            parsed = _parse_result(final_response)
             return {
                 **parsed,
                 "effective_model_id": model_id,
@@ -276,7 +526,8 @@ class CodexRuntime:
         return (
             "Perform the assigned task using only the bounded Tether Brain context "
             "below and the provided local working directory. Attachments are intentionally "
-            "unavailable. Return a question only when user input is required. "
+            "unavailable. Ask only when a material decision is required and cannot be "
+            "resolved from the supplied context or repository. "
             "Routine progress belongs in the run timeline, not task comments.\n\n"
             "When a durable implementation summary would help, return it as a "
             "completion note.\n\n"

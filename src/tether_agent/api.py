@@ -109,7 +109,8 @@ class TetherApi:
         response = await self._request(
             "POST", "/api/agent/v1/installations/heartbeat", json=payload
         )
-        response.raise_for_status()
+        if response.is_error:
+            raise AgentApiError(response)
         return response.json()
 
     async def report_runtime_catalog(
@@ -271,5 +272,6 @@ class TetherApi:
                 ),
             },
         )
-        response.raise_for_status()
+        if response.is_error:
+            raise AgentApiError(response)
         return response.json()

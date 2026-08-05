@@ -1,5 +1,7 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import httpx
@@ -146,3 +148,123 @@ async def test_terminal_registration_conflict_is_not_retried(tmp_path: Path) -> 
 
     assert api.register_calls == 1
     assert store.get_setting("daemon_status") == "registration_blocked"
+
+
+@pytest.mark.asyncio
+async def test_control_plane_heartbeat_continues_independently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, daemon = initialized_daemon(tmp_path)
+    daemon.installation_id = uuid4()
+    daemon.approved_manifest_digest = "approved"
+    liveness_calls = 0
+
+    class Api:
+        async def liveness(self, payload: dict[str, object]) -> dict[str, object]:
+            nonlocal liveness_calls
+            assert payload["installation_id"] == str(daemon.installation_id)
+            liveness_calls += 1
+            return {}
+
+    await daemon.api.close()
+    daemon.api = Api()
+    monkeypatch.setattr("tether_agent.daemon.CONTROL_PLANE_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(daemon, "_refresh_catalogs", AsyncMock())
+    stop = asyncio.Event()
+    task = asyncio.create_task(daemon._control_plane_loop(stop))
+    await asyncio.sleep(0.04)
+    stop.set()
+    await task
+
+    assert liveness_calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_reclaimed_run_resubmits_saved_result_without_running_codex(
+    tmp_path: Path,
+) -> None:
+    _, store, daemon = initialized_daemon(tmp_path)
+    run_id = uuid4()
+    result = {
+        "status": "completed",
+        "message": "Already finished",
+        "outputs": [],
+        "completion_note": None,
+        "effective_model_id": "gpt-test",
+        "effective_reasoning_effort": "high",
+    }
+    store.save_claim(run_id, 1, "old-lease")
+    store.save_pending_result(run_id, result)
+    runtime = SimpleNamespace(run=AsyncMock(side_effect=AssertionError("must not run")))
+    daemon.runtimes = SimpleNamespace(get=lambda _: runtime)
+    completed_payloads: list[dict[str, object]] = []
+
+    class Api:
+        async def state(self, *args: object, **kwargs: object) -> dict[str, object]:
+            del args, kwargs
+            return {}
+
+        async def complete(self, *args: object, **kwargs: object) -> dict[str, object]:
+            completed_payloads.append({"args": args, "kwargs": kwargs})
+            return {"state": "review"}
+
+        async def heartbeat(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    await daemon.api.close()
+    daemon.api = Api()
+    await daemon._execute(
+        {
+            "lease_token": "new-lease",
+            "run": {
+                "id": str(run_id),
+                "lease_generation": 2,
+                "runtime_kind": "codex_cli",
+                "model_id": "gpt-test",
+                "reasoning_effort": "high",
+                "task_version": 7,
+            },
+        }
+    )
+
+    assert len(completed_payloads) == 1
+    runtime.run.assert_not_awaited()
+    assert store.pending_result(run_id) is None
+
+
+def test_remote_safe_redacts_arbitrary_absolute_paths_but_preserves_urls(
+    tmp_path: Path,
+) -> None:
+    _, _, daemon = initialized_daemon(tmp_path)
+
+    value = daemon._remote_safe(
+        "Read /home/person/private.txt and file:///tmp/secret; see https://example.com/a."
+    )
+
+    assert value == ("Read [local-path] and [local-path]; see https://example.com/a.")
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_completion_clears_crash_recovery_result(
+    tmp_path: Path,
+) -> None:
+    _, store, daemon = initialized_daemon(tmp_path)
+    run_id = uuid4()
+    store.save_claim(run_id, 1, "lease")
+    store.save_pending_result(
+        run_id,
+        {"status": "completed", "message": "done", "outputs": []},
+    )
+
+    class Api:
+        async def run(self, requested_run_id: object) -> dict[str, object]:
+            assert requested_run_id == run_id
+            return {"state": "review"}
+
+    await daemon.api.close()
+    daemon.api = Api()
+    await daemon._reconcile_pending_results()
+
+    assert store.pending_result(run_id) is None
+    assert store.leased_run_ids() == []

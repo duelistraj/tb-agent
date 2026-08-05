@@ -2,8 +2,10 @@ import asyncio
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 import pytest
 
+from tether_agent.api import AgentApiError
 from tether_agent.config import (
     ProfileConfig,
     ProjectMapping,
@@ -94,3 +96,53 @@ async def test_pending_capability_approval_pauses_claims(tmp_path: Path) -> None
     assert api.register_calls == 1
     assert api.claim_calls == 0
     assert store.get_setting("installation_status") == "pending_approval"
+
+
+@pytest.mark.asyncio
+async def test_registration_sends_configuration_revision(tmp_path: Path) -> None:
+    _, _, daemon = initialized_daemon(tmp_path)
+    captured: dict[str, object] = {}
+
+    class Api(PendingApi):
+        async def register(self, payload: dict) -> dict:
+            captured.update(payload)
+            return await super().register(payload)
+
+    await daemon.api.close()
+    daemon.api = Api()
+    await daemon.register_once()
+
+    assert captured["configuration_revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_registration_conflict_is_not_retried(tmp_path: Path) -> None:
+    _, store, daemon = initialized_daemon(tmp_path)
+    request = httpx.Request("POST", "https://tetherbrain.net/register")
+    response = httpx.Response(
+        409,
+        request=request,
+        json={
+            "detail": {
+                "code": "installation_credential_mismatch",
+                "message": "Run tb-agent auth login for this profile.",
+                "recoverable": False,
+            }
+        },
+    )
+
+    class Api(PendingApi):
+        async def register(self, payload: dict) -> dict:
+            del payload
+            self.register_calls += 1
+            raise AgentApiError(response)
+
+    await daemon.api.close()
+    api = Api()
+    daemon.api = api
+
+    with pytest.raises(RuntimeError, match="auth login"):
+        await daemon.register()
+
+    assert api.register_calls == 1
+    assert store.get_setting("daemon_status") == "registration_blocked"

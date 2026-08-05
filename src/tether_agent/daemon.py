@@ -17,7 +17,7 @@ import httpx
 from openai_codex import CodexError
 
 from tether_agent import __version__
-from tether_agent.api import TetherApi
+from tether_agent.api import AgentApiError, TetherApi
 from tether_agent.config import DaemonSettings, load_effective_settings
 from tether_agent.locking import LockUnavailable, ProfileLock
 from tether_agent.oauth import refresh_credential
@@ -167,6 +167,7 @@ class AgentDaemon:
                 "name": self.settings.installation_name,
                 "protocol_version": self.settings.protocol_version,
                 "daemon_version": __version__,
+                "configuration_revision": self.store.configuration_revision(),
                 "capabilities": self._capabilities(),
             }
         )
@@ -194,6 +195,12 @@ class AgentDaemon:
         while True:
             try:
                 response = await self.register_once()
+            except AgentApiError as exc:
+                if not exc.recoverable:
+                    self.store.set_daemon_status("registration_blocked")
+                    raise RuntimeError(exc.user_message) from exc
+                logger.warning("Agent registration failed and will be retried: %s", exc)
+                self.store.set_daemon_status("registration_error")
             except httpx.HTTPError as exc:
                 logger.warning("Agent registration failed and will be retried: %s", exc)
                 self.store.set_daemon_status("registration_error")
@@ -258,6 +265,19 @@ class AgentDaemon:
                         await self._cleanup_worktrees()
                     else:
                         await self._execute(claim)
+                except AgentApiError as exc:
+                    if not exc.recoverable:
+                        self.store.set_daemon_status("registration_blocked")
+                        logger.error(
+                            "Daemon registration is blocked: %s",
+                            exc.user_message,
+                        )
+                        raise
+                    self.store.set_daemon_status("operation_error")
+                    logger.warning(
+                        "Daemon operation failed and will be retried: %s",
+                        exc,
+                    )
                 except (
                     CodexError,
                     httpx.HTTPError,

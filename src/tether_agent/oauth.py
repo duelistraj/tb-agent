@@ -429,6 +429,7 @@ async def _oauth_login_unlocked(
         "installation_name": config.installation_name,
         "protocol_version": config.protocol_version,
         "daemon_version": __version__,
+        "configuration_revision": store.configuration_revision(),
         "mode": mode,
         "intent": intent,
         "projects": [

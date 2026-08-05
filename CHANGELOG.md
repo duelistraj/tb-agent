@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.7.2 - 2026-08-05
+
+### Changed
+
+- Send the local configuration revision with OAuth setup and capability registration.
+- Stop retrying terminal registration conflicts and show the server's safe recovery message.
+- Keep interactive initialization alive through capability approval and model catalogue reporting.
+
 ## 0.7.1 - 2026-08-04
 
 ### Fixed

@@ -156,6 +156,28 @@ async def _register_profile(paths: ProfilePaths) -> dict:
         await daemon.api.close()
 
 
+async def _finish_guided_setup(
+    paths: ProfilePaths,
+    initial: dict,
+) -> dict:
+    """Keep setup alive until approval and model catalogue reporting finish."""
+    response = initial
+    if response["status"] == "active":
+        return response
+    print("Waiting for capability approval in the open browser page...")
+    deadline = time.monotonic() + 600
+    while response["status"] != "active":
+        if time.monotonic() >= deadline:
+            print(
+                "Setup is still awaiting approval. Run 'tb-agent init --path .' "
+                "to resume it later."
+            )
+            return response
+        await asyncio.sleep(2)
+        response = await _register_profile(paths)
+    return response
+
+
 def _print_registration(response: dict) -> None:
     if response["status"] == "active":
         print("Daemon installation is ready.")
@@ -636,6 +658,8 @@ def _initialize_profile(args: argparse.Namespace, paths: ProfilePaths) -> int:
             if args.auth == "pat" or deferred_repository is not None
             else result["installation"]
         )
+        if args.auth == "oauth" and sys.stdin.isatty():
+            registration = asyncio.run(_finish_guided_setup(paths, registration))
     except BaseException:
         paths.config_file.unlink(missing_ok=True)
         if state_existed:

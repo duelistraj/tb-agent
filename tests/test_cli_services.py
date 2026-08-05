@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 from tether_agent.cli import (
+    _finish_guided_setup,
     _reconcile_oauth_credential,
     _RedactPatFilter,
     build_parser,
@@ -65,6 +66,34 @@ def test_parser_exposes_every_phase_one_command() -> None:
     for command in commands:
         parsed = parser.parse_args(["--profile", "testing", *command])
         assert parsed.profile == "testing"
+
+
+@pytest.mark.asyncio
+async def test_guided_setup_waits_for_approval_before_returning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = ProfilePaths("default", tmp_path / "config", tmp_path / "state")
+    registrations = 0
+
+    async def register(_: ProfilePaths) -> dict:
+        nonlocal registrations
+        registrations += 1
+        return {"id": str(uuid4()), "status": "active"}
+
+    async def no_wait(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("tether_agent.cli._register_profile", register)
+    monkeypatch.setattr("tether_agent.cli.asyncio.sleep", no_wait)
+
+    result = await _finish_guided_setup(
+        paths,
+        {"id": str(uuid4()), "status": "pending_approval"},
+    )
+
+    assert result["status"] == "active"
+    assert registrations == 1
 
 
 def test_existing_revoked_profile_is_replaced_by_init_without_manual_cleanup(

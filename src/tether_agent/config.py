@@ -37,6 +37,7 @@ MUTABLE_ENV_KEYS = frozenset(
         "TETHER_AGENT_CONFIG_REVISION",
         "TETHER_AGENT_INSTALLATION_ID",
         "TETHER_AGENT_INSTALLATION_NAME",
+        "TETHER_AGENT_MAX_CONCURRENT_RUNS",
         "TETHER_AGENT_OAUTH_CLIENT_ID",
         "TETHER_AGENT_OAUTH_REFRESH_TOKEN",
         "TETHER_AGENT_POLL_SECONDS",
@@ -147,6 +148,7 @@ class ProfileConfig(BaseModel):
     )
     protocol_version: str = "1"
     poll_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    max_concurrent_runs: int = Field(default=1, ge=1, le=4)
     sandbox: Literal["read_only", "workspace_write"] = "workspace_write"
     allow_network: bool = False
     runtime_adapters: list[RuntimeAdapterSettings] = Field(
@@ -205,6 +207,7 @@ class DaemonSettings(BaseSettings):
     state_path: Path = Path(".tether-agent/state.sqlite3")
     config_revision: int = Field(default=0, ge=0)
     poll_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    max_concurrent_runs: int = Field(default=1, ge=1, le=4)
     protocol_version: str = "1"
     sandbox: Literal["read_only", "workspace_write"] = "workspace_write"
     allow_network: bool = False
@@ -268,6 +271,7 @@ def serialize_profile_config(config: ProfileConfig) -> bytes:
         f"installation_name = {_toml_string(config.installation_name)}",
         f"protocol_version = {_toml_string(config.protocol_version)}",
         f"poll_seconds = {config.poll_seconds}",
+        f"max_concurrent_runs = {config.max_concurrent_runs}",
         f"sandbox = {_toml_string(config.sandbox)}",
         f"allow_network = {str(config.allow_network).lower()}",
         "",

@@ -74,8 +74,14 @@ class PendingApi:
             "profiles": [],
         }
 
-    async def claim(self, installation_id: object) -> None:
-        del installation_id
+    async def claim(
+        self,
+        installation_id: object,
+        *,
+        worker_slot: int = 0,
+        configured_capacity: int = 1,
+    ) -> None:
+        del installation_id, worker_slot, configured_capacity
         self.claim_calls += 1
 
     async def close(self) -> None:
@@ -115,6 +121,25 @@ async def test_registration_sends_configuration_revision(tmp_path: Path) -> None
     await daemon.register_once()
 
     assert captured["configuration_revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_review_releases_persisted_port_reservation(
+    tmp_path: Path,
+) -> None:
+    _, store, daemon = initialized_daemon(tmp_path)
+    run_id = uuid4()
+    store.save_claim(run_id, 1, "lease-secret", 0)
+    daemon.ports.allocate(run_id=run_id, worker_slot=0)
+    daemon.api.run = AsyncMock(return_value={"state": "rejected"})
+
+    await daemon._reconcile_terminal_resources()
+
+    reservation = store.port_reservation(run_id)
+    assert reservation is not None
+    assert reservation.state == "released"
+    assert store.active_run_ids() == []
+    await daemon.api.close()
 
 
 @pytest.mark.asyncio

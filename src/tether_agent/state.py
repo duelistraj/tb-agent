@@ -39,6 +39,33 @@ class CredentialRecord:
     reauthentication_required: bool
 
 
+@dataclass(frozen=True, slots=True)
+class PortReservation:
+    run_id: UUID
+    worker_slot: int
+    port_start: int
+    port_end: int
+    state: str
+    revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class ChangeSetRecord:
+    run_id: UUID
+    state: str
+    repository_path: Path
+    worktree_path: Path
+    base_commit: str
+    snapshot_commit: str | None
+    snapshot_tree: str | None
+    validation_revision: int
+    change_set_revision: int
+    validation_status: str
+    accepted_revision: int | None
+    accepted_snapshot_commit: str | None
+    accepted_snapshot_tree: str | None
+
+
 class StateStore:
     def __init__(self, path: Path, *, initialize: bool = True) -> None:
         self.path = path.expanduser()
@@ -136,10 +163,76 @@ class StateStore:
                     run_id TEXT PRIMARY KEY,
                     lease_generation INTEGER,
                     lease_token TEXT,
+                    worker_slot INTEGER,
                     thread_id TEXT,
                     state TEXT NOT NULL,
                     worktree_path TEXT,
                     pending_result TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS port_reservations (
+                    run_id TEXT PRIMARY KEY,
+                    worker_slot INTEGER NOT NULL,
+                    port_start INTEGER NOT NULL,
+                    port_end INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    released_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    CHECK(worker_slot >= 0 AND worker_slot < 4),
+                    CHECK(port_start >= 1024),
+                    CHECK(port_end >= port_start)
+                );
+                CREATE TABLE IF NOT EXISTS change_sets (
+                    run_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    repository_path TEXT NOT NULL,
+                    worktree_path TEXT NOT NULL,
+                    base_commit TEXT NOT NULL,
+                    snapshot_commit TEXT,
+                    snapshot_tree TEXT,
+                    validation_revision INTEGER NOT NULL DEFAULT 0,
+                    change_set_revision INTEGER NOT NULL DEFAULT 1,
+                    validation_status TEXT NOT NULL DEFAULT 'not_run',
+                    accepted_revision INTEGER,
+                    accepted_snapshot_commit TEXT,
+                    accepted_snapshot_tree TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK(validation_revision >= 0),
+                    CHECK(change_set_revision >= 1)
+                );
+                CREATE TABLE IF NOT EXISTS validation_runs (
+                    run_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    command_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    exit_code INTEGER,
+                    log_path TEXT,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    PRIMARY KEY(run_id, revision),
+                    FOREIGN KEY(run_id) REFERENCES change_sets(run_id)
+                        ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS handoffs (
+                    run_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    snapshot_commit TEXT NOT NULL,
+                    snapshot_tree TEXT NOT NULL,
+                    validation_revision INTEGER NOT NULL,
+                    change_set_revision INTEGER NOT NULL,
+                    checkout_path TEXT NOT NULL,
+                    common_directory TEXT NOT NULL,
+                    captured_head TEXT,
+                    captured_branch TEXT,
+                    captured_status TEXT,
+                    captured_index_digest TEXT,
+                    method TEXT,
+                    applied_commit TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS worktrees (
@@ -205,6 +298,8 @@ class StateStore:
             }
             if "pending_result" not in run_columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN pending_result TEXT")
+            if "worker_slot" not in run_columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN worker_slot INTEGER")
             setup_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -449,8 +544,31 @@ class StateStore:
             None,
         )
         with self.connection(immediate=True) as connection:
-            connection.execute("DELETE FROM runs")
-            connection.execute("DELETE FROM worktrees")
+            connection.execute(
+                """
+                UPDATE runs
+                SET state = CASE
+                        WHEN state IN ('review', 'completed', 'failed', 'cancelled')
+                        THEN state
+                        ELSE 'cancelled'
+                    END,
+                    lease_generation = NULL,
+                    lease_token = NULL,
+                    updated_at = ?
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE port_reservations
+                SET state = 'released', released_at = ?, updated_at = ?
+                WHERE state = 'active'
+                  AND run_id IN (
+                      SELECT run_id FROM runs WHERE state = 'cancelled'
+                  )
+                """,
+                (now, now),
+            )
             connection.execute("DELETE FROM secrets WHERE key = 'pat'")
             connection.execute(
                 "DELETE FROM settings WHERE key IN "
@@ -722,7 +840,445 @@ class StateStore:
 
     def active_run_id(self) -> UUID | None:
         raw = self.get_setting("active_run_id")
-        return UUID(raw) if raw else None
+        active = self.leased_run_ids()
+        if raw:
+            legacy = UUID(raw)
+            if legacy in active:
+                return legacy
+            self.delete_setting("active_run_id")
+        return active[0] if active else None
+
+    def active_run_ids(self) -> list[UUID]:
+        return self.leased_run_ids()
+
+    @staticmethod
+    def _change_set(row: sqlite3.Row) -> ChangeSetRecord:
+        return ChangeSetRecord(
+            run_id=UUID(str(row["run_id"])),
+            state=str(row["state"]),
+            repository_path=Path(str(row["repository_path"])),
+            worktree_path=Path(str(row["worktree_path"])),
+            base_commit=str(row["base_commit"]),
+            snapshot_commit=row["snapshot_commit"],
+            snapshot_tree=row["snapshot_tree"],
+            validation_revision=int(row["validation_revision"]),
+            change_set_revision=int(row["change_set_revision"]),
+            validation_status=str(row["validation_status"]),
+            accepted_revision=(
+                int(row["accepted_revision"])
+                if row["accepted_revision"] is not None
+                else None
+            ),
+            accepted_snapshot_commit=row["accepted_snapshot_commit"],
+            accepted_snapshot_tree=row["accepted_snapshot_tree"],
+        )
+
+    def change_set(self, run_id: UUID) -> ChangeSetRecord | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM change_sets WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+        return self._change_set(row) if row is not None else None
+
+    def change_sets(self) -> list[ChangeSetRecord]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM change_sets ORDER BY created_at DESC, run_id"
+            ).fetchall()
+        return [self._change_set(row) for row in rows]
+
+    def begin_change_set(
+        self,
+        *,
+        run_id: UUID,
+        repository_path: Path,
+        worktree_path: Path,
+        base_commit: str,
+        legacy: bool = False,
+    ) -> ChangeSetRecord:
+        now = datetime.now(UTC).isoformat()
+        state = "legacy_manual_review_required" if legacy else "executing"
+        with self.connection(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO change_sets(
+                    run_id, state, repository_path, worktree_path, base_commit,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (
+                    str(run_id),
+                    state,
+                    str(repository_path),
+                    str(worktree_path),
+                    base_commit,
+                    now,
+                    now,
+                ),
+            )
+        record = self.change_set(run_id)
+        assert record is not None
+        if (
+            record.repository_path != repository_path
+            or record.worktree_path != worktree_path
+            or record.base_commit != base_commit
+        ):
+            raise RuntimeError("Run change-set identity does not match local state")
+        return record
+
+    def transition_change_set(
+        self,
+        run_id: UUID,
+        *,
+        expected_states: frozenset[str],
+        next_state: str,
+        expected_revision: int | None = None,
+        values: dict[str, object] | None = None,
+        increment_revision: bool = False,
+    ) -> ChangeSetRecord:
+        updates = dict(values or {})
+        now = datetime.now(UTC).isoformat()
+        with self.connection(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM change_sets WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"Change set {run_id} does not exist")
+            current = self._change_set(row)
+            if expected_revision is not None and (
+                current.change_set_revision != expected_revision
+            ):
+                raise RuntimeError("Change-set revision changed")
+            if current.state == next_state and all(
+                row[key] == value for key, value in updates.items()
+            ):
+                return current
+            if current.state not in expected_states:
+                raise RuntimeError(
+                    f"Invalid change-set transition {current.state} -> {next_state}"
+                )
+            assignments = ["state = ?", "updated_at = ?"]
+            parameters: list[object] = [next_state, now]
+            allowed_columns = {
+                "snapshot_commit",
+                "snapshot_tree",
+                "validation_revision",
+                "validation_status",
+                "accepted_revision",
+                "accepted_snapshot_commit",
+                "accepted_snapshot_tree",
+            }
+            for key, value in updates.items():
+                if key not in allowed_columns:
+                    raise ValueError(f"Unsupported change-set field: {key}")
+                assignments.append(f"{key} = ?")
+                parameters.append(value)
+            if increment_revision:
+                assignments.append("change_set_revision = change_set_revision + 1")
+            parameters.append(str(run_id))
+            connection.execute(
+                f"UPDATE change_sets SET {', '.join(assignments)} WHERE run_id = ?",
+                parameters,
+            )
+            updated = connection.execute(
+                "SELECT * FROM change_sets WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+        assert updated is not None
+        return self._change_set(updated)
+
+    def begin_validation(self, run_id: UUID, command: list[str]) -> int:
+        now = datetime.now(UTC).isoformat()
+        with self.connection(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT validation_revision, state FROM change_sets WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"Change set {run_id} does not exist")
+            if row["state"] not in {"snapshot_ready", "review_ready"}:
+                raise RuntimeError("Only an immutable snapshot can be validated")
+            revision = int(row["validation_revision"]) + 1
+            connection.execute(
+                """
+                INSERT INTO validation_runs(
+                    run_id, revision, command_json, state, started_at
+                ) VALUES (?, ?, ?, 'running', ?)
+                """,
+                (str(run_id), revision, json.dumps(command), now),
+            )
+            connection.execute(
+                """
+                UPDATE change_sets
+                SET state = 'validating', validation_revision = ?,
+                    validation_status = 'running', updated_at = ?
+                WHERE run_id = ?
+                """,
+                (revision, now, str(run_id)),
+            )
+        return revision
+
+    def accept_change_set(
+        self,
+        *,
+        run_id: UUID,
+        snapshot_commit: str,
+        snapshot_tree: str,
+        validation_revision: int,
+        change_set_revision: int,
+    ) -> ChangeSetRecord:
+        record = self.change_set(run_id)
+        if record is None:
+            raise RuntimeError(f"Change set {run_id} does not exist")
+        expected = (
+            record.snapshot_commit,
+            record.snapshot_tree,
+            record.validation_revision,
+            record.change_set_revision,
+        )
+        accepted = (
+            snapshot_commit,
+            snapshot_tree,
+            validation_revision,
+            change_set_revision,
+        )
+        if expected != accepted:
+            raise RuntimeError("Accepted change-set binding does not match local state")
+        return self.transition_change_set(
+            run_id,
+            expected_states=frozenset({"review_ready"}),
+            next_state="accepted",
+            expected_revision=change_set_revision,
+            values={
+                "accepted_revision": change_set_revision,
+                "accepted_snapshot_commit": snapshot_commit,
+                "accepted_snapshot_tree": snapshot_tree,
+            },
+        )
+
+    def finish_validation(
+        self,
+        run_id: UUID,
+        *,
+        revision: int,
+        exit_code: int,
+        log_path: Path,
+    ) -> ChangeSetRecord:
+        now = datetime.now(UTC).isoformat()
+        status = "passed" if exit_code == 0 else "failed"
+        with self.connection(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT state, validation_revision FROM change_sets WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"Change set {run_id} does not exist")
+            if int(row["validation_revision"]) != revision:
+                raise RuntimeError("Validation revision changed")
+            validation = connection.execute(
+                "SELECT state FROM validation_runs WHERE run_id = ? AND revision = ?",
+                (str(run_id), revision),
+            ).fetchone()
+            if validation is None:
+                raise RuntimeError("Validation run does not exist")
+            if validation["state"] == status and row["state"] == "review_ready":
+                record = connection.execute(
+                    "SELECT * FROM change_sets WHERE run_id = ?", (str(run_id),)
+                ).fetchone()
+                assert record is not None
+                return self._change_set(record)
+            if row["state"] != "validating" or validation["state"] != "running":
+                raise RuntimeError("Validation is not running")
+            connection.execute(
+                """
+                UPDATE validation_runs
+                SET state = ?, exit_code = ?, log_path = ?, finished_at = ?
+                WHERE run_id = ? AND revision = ?
+                """,
+                (status, exit_code, str(log_path), now, str(run_id), revision),
+            )
+            connection.execute(
+                """
+                UPDATE change_sets
+                SET state = 'review_ready', validation_status = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (status, now, str(run_id)),
+            )
+            record = connection.execute(
+                "SELECT * FROM change_sets WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+        assert record is not None
+        return self._change_set(record)
+
+    def cancel_validation_start(self, run_id: UUID, revision: int) -> None:
+        with self.connection(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT state, validation_revision FROM change_sets WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "validating"
+                or int(row["validation_revision"]) != revision
+            ):
+                raise RuntimeError("Validation start cannot be rolled back")
+            previous = connection.execute(
+                """
+                SELECT state FROM validation_runs
+                WHERE run_id = ? AND revision < ?
+                ORDER BY revision DESC LIMIT 1
+                """,
+                (str(run_id), revision),
+            ).fetchone()
+            connection.execute(
+                "DELETE FROM validation_runs WHERE run_id = ? AND revision = ?",
+                (str(run_id), revision),
+            )
+            connection.execute(
+                """
+                UPDATE change_sets
+                SET state = 'review_ready', validation_revision = ?,
+                    validation_status = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    revision - 1,
+                    str(previous["state"]) if previous is not None else "not_run",
+                    datetime.now(UTC).isoformat(),
+                    str(run_id),
+                ),
+            )
+
+    def handoff(self, run_id: UUID) -> sqlite3.Row | None:
+        with self.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM handoffs WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+
+    def begin_handoff(
+        self,
+        *,
+        run_id: UUID,
+        snapshot_commit: str,
+        snapshot_tree: str,
+        validation_revision: int,
+        change_set_revision: int,
+        checkout_path: Path,
+        common_directory: Path,
+        captured_head: str,
+        captured_branch: str | None,
+        captured_status: str,
+        captured_index_digest: str,
+        method: str,
+    ) -> sqlite3.Row:
+        now = datetime.now(UTC).isoformat()
+        with self.connection(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO handoffs(
+                    run_id, state, snapshot_commit, snapshot_tree,
+                    validation_revision, change_set_revision, checkout_path,
+                    common_directory, captured_head, captured_branch,
+                    captured_status, captured_index_digest, method,
+                    created_at, updated_at
+                ) VALUES (?, 'applying', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    state = 'applying',
+                    checkout_path = excluded.checkout_path,
+                    common_directory = excluded.common_directory,
+                    captured_head = excluded.captured_head,
+                    captured_branch = excluded.captured_branch,
+                    captured_status = excluded.captured_status,
+                    captured_index_digest = excluded.captured_index_digest,
+                    method = excluded.method,
+                    error = NULL,
+                    updated_at = excluded.updated_at
+                WHERE handoffs.state = 'retry_requested'
+                """,
+                (
+                    str(run_id),
+                    snapshot_commit,
+                    snapshot_tree,
+                    validation_revision,
+                    change_set_revision,
+                    str(checkout_path),
+                    str(common_directory),
+                    captured_head,
+                    captured_branch,
+                    captured_status,
+                    captured_index_digest,
+                    method,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM handoffs WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+        assert row is not None
+        identity = (
+            row["snapshot_commit"],
+            row["snapshot_tree"],
+            int(row["validation_revision"]),
+            int(row["change_set_revision"]),
+        )
+        if identity != (
+            snapshot_commit,
+            snapshot_tree,
+            validation_revision,
+            change_set_revision,
+        ):
+            raise RuntimeError("Handoff identity does not match accepted revision")
+        return row
+
+    def request_handoff_retry(self, run_id: UUID) -> None:
+        with self.connection(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE handoffs
+                SET state = 'retry_requested', updated_at = ?
+                WHERE run_id = ? AND state = 'blocked'
+                """,
+                (datetime.now(UTC).isoformat(), str(run_id)),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Only a blocked handoff can be retried")
+
+    def finish_handoff(
+        self,
+        run_id: UUID,
+        *,
+        state: str,
+        applied_commit: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if state not in {"applied", "blocked"}:
+            raise ValueError("Unsupported handoff state")
+        with self.connection(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT state FROM handoffs WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"Handoff {run_id} does not exist")
+            if row["state"] == state:
+                return
+            if row["state"] != "applying":
+                raise RuntimeError("Handoff is not applying")
+            connection.execute(
+                """
+                UPDATE handoffs
+                SET state = ?, applied_commit = ?, error = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    state,
+                    applied_commit,
+                    error,
+                    datetime.now(UTC).isoformat(),
+                    str(run_id),
+                ),
+            )
 
     def leased_run_ids(self) -> list[UUID]:
         with self.connection() as connection:
@@ -735,6 +1291,114 @@ class StateStore:
                 """
             ).fetchall()
         return [UUID(row["run_id"]) for row in rows]
+
+    def leased_run_records(self) -> list[sqlite3.Row]:
+        with self.connection() as connection:
+            return connection.execute(
+                """
+                SELECT run_id, lease_generation, lease_token, worker_slot, state
+                FROM runs
+                WHERE lease_token IS NOT NULL
+                  AND state NOT IN ('review', 'completed', 'failed', 'cancelled')
+                ORDER BY COALESCE(worker_slot, 0), run_id
+                """
+            ).fetchall()
+
+    @staticmethod
+    def _port_reservation(row: sqlite3.Row) -> PortReservation:
+        return PortReservation(
+            run_id=UUID(str(row["run_id"])),
+            worker_slot=int(row["worker_slot"]),
+            port_start=int(row["port_start"]),
+            port_end=int(row["port_end"]),
+            state=str(row["state"]),
+            revision=int(row["revision"]),
+        )
+
+    def port_reservation(self, run_id: UUID) -> PortReservation | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM port_reservations WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+        return self._port_reservation(row) if row is not None else None
+
+    def active_port_reservations(self) -> list[PortReservation]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM port_reservations
+                WHERE released_at IS NULL
+                ORDER BY worker_slot, run_id
+                """
+            ).fetchall()
+        return [self._port_reservation(row) for row in rows]
+
+    def reserve_port_range(
+        self,
+        *,
+        run_id: UUID,
+        worker_slot: int,
+        port_start: int,
+        port_end: int,
+    ) -> PortReservation:
+        now = datetime.now(UTC).isoformat()
+        with self.connection(immediate=True) as connection:
+            existing = connection.execute(
+                "SELECT * FROM port_reservations WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if existing is not None:
+                reservation = self._port_reservation(existing)
+                if reservation.worker_slot != worker_slot:
+                    raise RuntimeError("Run already owns a different worker slot")
+                return reservation
+            overlap = connection.execute(
+                """
+                SELECT 1 FROM port_reservations
+                WHERE released_at IS NULL
+                  AND NOT (port_end < ? OR port_start > ?)
+                LIMIT 1
+                """,
+                (port_start, port_end),
+            ).fetchone()
+            if overlap is not None:
+                raise RuntimeError("Port range is already reserved by another run")
+            connection.execute(
+                """
+                INSERT INTO port_reservations(
+                    run_id, worker_slot, port_start, port_end, state,
+                    revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'reserved', 1, ?, ?)
+                """,
+                (
+                    str(run_id),
+                    worker_slot,
+                    port_start,
+                    port_end,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM port_reservations WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+        assert row is not None
+        return self._port_reservation(row)
+
+    def release_port_reservation(self, run_id: UUID) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connection(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE port_reservations
+                SET state = 'released', released_at = ?, updated_at = ?,
+                    revision = revision + 1
+                WHERE run_id = ? AND released_at IS NULL
+                """,
+                (now, now, str(run_id)),
+            )
 
     def set_daemon_status(self, value: str) -> None:
         now = datetime.now(UTC).isoformat()
@@ -835,28 +1499,28 @@ class StateStore:
                 (str(run_id), str(project_id)),
             )
 
-    def save_claim(self, run_id: UUID, generation: int, lease_token: str) -> None:
+    def save_claim(
+        self,
+        run_id: UUID,
+        generation: int,
+        lease_token: str,
+        worker_slot: int = 0,
+    ) -> None:
         now = datetime.now(UTC).isoformat()
         with self.connection(immediate=True) as connection:
             connection.execute(
                 """
                 INSERT INTO runs(
-                    run_id, lease_generation, lease_token, state, updated_at
-                ) VALUES (?, ?, ?, 'claimed', ?)
+                    run_id, lease_generation, lease_token, worker_slot, state, updated_at
+                ) VALUES (?, ?, ?, ?, 'claimed', ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     lease_generation = excluded.lease_generation,
                     lease_token = excluded.lease_token,
+                    worker_slot = excluded.worker_slot,
                     state = excluded.state,
                     updated_at = excluded.updated_at
                 """,
-                (str(run_id), generation, lease_token, now),
-            )
-            connection.execute(
-                """
-                INSERT INTO settings(key, value) VALUES ('active_run_id', ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (str(run_id),),
+                (str(run_id), generation, lease_token, worker_slot, now),
             )
 
     def thread_id(self, run_id: UUID) -> str | None:
@@ -920,7 +1584,4 @@ class StateStore:
                 """,
                 (state, datetime.now(UTC).isoformat(), str(run_id)),
             )
-            connection.execute(
-                "DELETE FROM settings WHERE key = 'active_run_id' AND value = ?",
-                (str(run_id),),
-            )
+            connection.execute("DELETE FROM settings WHERE key = 'active_run_id'")

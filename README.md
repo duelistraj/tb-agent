@@ -50,7 +50,8 @@ Initialization never installs a background service.
 Running the same command again is safe.
 For a healthy profile it reports that the repository is already configured, and for a browser-revoked installation it opens fresh-installation replacement through the same guided OAuth flow.
 The browser provides the explicit replacement approval, so the CLI does not ask for a duplicate terminal confirmation.
-The replacement keeps safe local repository and runtime settings but clears revoked credentials, leases, Codex thread state, and old server identities only after the new credential is validated.
+The replacement keeps repository mappings, immutable review records, retained worktrees, and completed Codex thread state.
+Any still-active lease is cancelled locally only after the replacement credential is validated.
 Profiles left in an unclassified reauthentication state by an older release perform one bounded refresh reconciliation before choosing reauthorization or replacement.
 Terminal credential failures are persisted so the daemon and later status commands do not repeatedly retry them.
 
@@ -92,6 +93,19 @@ tb-agent --profile work status
 Each profile has an independent configuration, credential, installation identity, daemon lock, and optional service.
 Only one daemon process may run for a profile.
 `default` is only the local profile name used when `--profile` is omitted.
+Do not create temporary profiles for parallel work.
+A single durable profile supervises multiple isolated run worktrees.
+
+Configure one to four concurrent runs:
+
+```bash
+tb-agent concurrency status
+tb-agent concurrency set 3
+```
+
+The default is one.
+Lowering capacity never cancels active work and affects only future claims.
+The server admits claims atomically from active, unexpired leases, while the daemon assigns a stable worker slot and a persisted collision-checked port range to each active run.
 
 List or remove local profiles without manually finding platform-specific directories:
 
@@ -237,6 +251,43 @@ They never contain a PAT or repository path.
 
 Existing systemd and LaunchAgent service identities are preserved during the executable rename.
 After upgrading from a release before 0.6.0, run `tb-agent service install` once to rewrite an older service definition that invokes the removed executable.
+
+## Review and apply local changes
+
+Every writable run uses its own Git worktree.
+After execution, tb-agent creates one synthetic immutable commit under `refs/tb-agent/runs/<run-id>` whose parent is the captured run base.
+The snapshot tree hash is the reviewed content identity, even when later application creates a different cherry-pick commit SHA.
+
+Inspect and validate retained results locally:
+
+```bash
+tb-agent changes list
+tb-agent changes status <run-id>
+tb-agent changes diff <run-id>
+tb-agent changes test <run-id> -- npm test
+```
+
+`changes test` creates a temporary detached checkout of the immutable snapshot.
+It never tests later manual worktree edits, reports the validation revision to Tether Brain, and stores the local validation log.
+Any worktree modification after snapshot creation supersedes the current review revision.
+
+Browser acceptance binds the run ID, snapshot commit, snapshot tree, validation revision, and change-set revision.
+Only that accepted binding may be applied.
+The daemon fast-forwards when the target checkout still equals the run base.
+Otherwise it cherry-picks only when the base remains an ancestor of the current branch.
+The target checkout must have no staged, unstaged, untracked, conflicted, or dirty submodule state.
+
+If an explicitly accepted handoff is blocked, clean or reconcile the target checkout and retry it:
+
+```bash
+tb-agent changes apply <run-id>
+```
+
+This command cannot accept a result and refuses any revision that has not already been accepted in Tether Brain.
+Repository handoff locks are derived from the canonical Git common directory, so separate profiles and processes cannot apply to the same repository concurrently.
+
+Dirty worktrees created by an older release are marked `legacy_manual_review_required`.
+They can be inspected or rerun, but tb-agent never turns their existing filesystem contents into an automatically accepted snapshot.
 
 ## Local security and state
 

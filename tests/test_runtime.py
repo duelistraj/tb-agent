@@ -6,11 +6,27 @@ from typing import Any
 
 from tether_agent.runtime import (
     RESULT_SCHEMA,
+    _child_environment,
     _final_response_from_items,
     _item_activity,
     _parse_result,
     _repository_relative_path,
 )
+
+
+def test_child_environment_excludes_daemon_credentials(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TETHER_AGENT_ACCESS_TOKEN", "tb_pat_secret")
+    monkeypatch.setenv("TETHER_AGENT_OAUTH_REFRESH_TOKEN", "tb_irt_secret")
+    monkeypatch.setenv("SAFE_VALUE", "kept")
+
+    environment = _child_environment({"TB_AGENT_WORKER_SLOT": "2"})
+
+    assert "TETHER_AGENT_ACCESS_TOKEN" not in environment
+    assert "TETHER_AGENT_OAUTH_REFRESH_TOKEN" not in environment
+    assert environment["SAFE_VALUE"] == "kept"
+    assert environment["TB_AGENT_WORKER_SLOT"] == "2"
 
 
 def object_schemas(value: Any) -> Iterator[dict[str, Any]]:

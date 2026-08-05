@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Awaitable, Callable
@@ -12,12 +13,29 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID
 
-from openai_codex import AsyncCodex, Sandbox
+from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
 from tether_agent.config import RuntimeAdapterSettings
 from tether_agent.state import StateStore
 
 ProgressCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
+DAEMON_SECRET_ENVIRONMENT_KEYS = frozenset(
+    {
+        "TETHER_AGENT_ACCESS_TOKEN",
+        "TETHER_AGENT_OAUTH_REFRESH_TOKEN",
+    }
+)
+
+
+def _child_environment(overrides: dict[str, str]) -> dict[str, str]:
+    return {
+        **{
+            key: value
+            for key, value in os.environ.items()
+            if key not in DAEMON_SECRET_ENVIRONMENT_KEYS
+        },
+        **overrides,
+    }
 
 
 def _enum_value(value: Any) -> str | None:
@@ -204,6 +222,7 @@ class RuntimeAdapter(Protocol):
         working_directory: Path,
         model_id: str,
         reasoning_effort: str | None,
+        environment: dict[str, str],
         progress: ProgressCallback,
     ) -> dict[str, Any]: ...
 
@@ -378,6 +397,7 @@ class CodexRuntime:
         working_directory: Path,
         model_id: str,
         reasoning_effort: str | None,
+        environment: dict[str, str],
         progress: ProgressCallback,
     ) -> dict[str, Any]:
         prompt = self._prompt(context)
@@ -390,7 +410,8 @@ class CodexRuntime:
                 "milestone": True,
             },
         )
-        async with AsyncCodex() as codex:
+        child_environment = _child_environment(environment)
+        async with AsyncCodex(CodexConfig(env=child_environment)) as codex:
             saved_thread_id = self.store.thread_id(run_id)
             if saved_thread_id:
                 thread = await codex.thread_resume(
@@ -590,6 +611,7 @@ class CommandRuntime:
         working_directory: Path,
         model_id: str,
         reasoning_effort: str | None,
+        environment: dict[str, str],
         progress: ProgressCallback,
     ) -> dict[str, Any]:
         del run_id
@@ -609,6 +631,7 @@ class CommandRuntime:
             subprocess.run,
             command,
             cwd=working_directory,
+            env=_child_environment(environment),
             check=True,
             capture_output=True,
             text=True,

@@ -135,11 +135,21 @@ class TetherApi:
         response.raise_for_status()
         return response.json()
 
-    async def claim(self, installation_id: UUID) -> dict[str, Any] | None:
+    async def claim(
+        self,
+        installation_id: UUID,
+        *,
+        worker_slot: int = 0,
+        configured_capacity: int = 1,
+    ) -> dict[str, Any] | None:
         response = await self._request(
             "POST",
             "/api/agent/v1/runs/claim",
-            json={"installation_id": str(installation_id)},
+            json={
+                "installation_id": str(installation_id),
+                "worker_slot": worker_slot,
+                "configured_capacity": configured_capacity,
+            },
         )
         if response.status_code == 204:
             return None
@@ -253,6 +263,7 @@ class TetherApi:
         final_comment: str,
         outputs: list[dict[str, Any]],
         completion_note: dict[str, str] | None = None,
+        change_set: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         response = await self._request(
             "POST",
@@ -270,7 +281,87 @@ class TetherApi:
                 "completion_note_markdown": (
                     completion_note["markdown"] if completion_note is not None else None
                 ),
+                "change_set": change_set,
             },
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
+    async def pending_handoffs(self, installation_id: UUID) -> list[dict[str, Any]]:
+        response = await self._request(
+            "GET",
+            f"/api/agent/v1/installations/{installation_id}/handoffs",
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
+    async def start_handoff(
+        self,
+        run_id: UUID,
+        binding: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/handoff/start",
+            json=binding,
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
+    async def report_change_set_validation(
+        self,
+        run_id: UUID,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/change-set/validation",
+            json=payload,
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
+    async def supersede_change_set(
+        self,
+        run_id: UUID,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/change-set/supersede",
+            json=payload,
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
+    async def complete_handoff(
+        self,
+        run_id: UUID,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/handoff/complete",
+            json=payload,
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
+    async def acknowledge_handoff(
+        self,
+        run_id: UUID,
+        binding: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/handoff/acknowledge",
+            json=binding,
         )
         if response.is_error:
             raise AgentApiError(response)

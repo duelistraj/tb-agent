@@ -179,6 +179,24 @@ def test_profile_lock_allows_only_one_holder(tmp_path: Path) -> None:
     second.release()
 
 
+def test_live_capacity_change_does_not_require_execution_maintenance(
+    tmp_path: Path,
+) -> None:
+    paths, manager = initialized_profile(tmp_path)
+    run_id = uuid4()
+    manager.store.save_claim(run_id, 1, "lease-token", worker_slot=0)
+
+    updated = manager.mutate_live_configuration(
+        lambda current: current.model_copy(update={"max_concurrent_runs": 3}),
+        environment_keys=frozenset(),
+    )
+
+    assert updated.max_concurrent_runs == 3
+    assert updated.revision == 2
+    assert load_profile_config(paths.config_file).max_concurrent_runs == 3
+    assert manager.store.active_run_ids() == [run_id]
+
+
 def test_mutation_rejects_stale_active_execution(tmp_path: Path) -> None:
     _, manager = initialized_profile(tmp_path)
     run_id = uuid4()
@@ -277,7 +295,7 @@ def test_sqlite_busy_timeout_allows_serialized_writers(tmp_path: Path) -> None:
     assert store.get_setting("second") == "writer"
 
 
-def test_replacement_activation_clears_server_bound_state_atomically(
+def test_replacement_activation_detaches_active_state_without_deleting_history(
     tmp_path: Path,
 ) -> None:
     store = StateStore(tmp_path / "state/state.sqlite3")
@@ -314,7 +332,7 @@ def test_replacement_activation_clears_server_bound_state_atomically(
     assert store.get_setting("credential_failure_code") is None
     assert store.get_secret("pat") is None
     assert store.active_run_id() is None
-    assert store.thread_id(run_id) is None
+    assert store.thread_id(run_id) == "codex-thread-old"
 
 
 def test_deleting_credentials_clears_terminal_classification(tmp_path: Path) -> None:

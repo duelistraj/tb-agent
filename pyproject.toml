@@ -1,6 +1,6 @@
 [project]
 name = "tb-agent"
-version = "0.7.3"
+version = "0.8.0"
 description = "Local execution daemon for Tether Brain agent installations"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.28,<1",
-    "openai-codex>=0.1,<1",
+    "openai-codex>=0.14.4,<1",
     "pydantic>=2.12,<3",
     "pydantic-settings>=2.12,<3",
 ]

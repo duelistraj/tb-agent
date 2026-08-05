@@ -710,7 +710,7 @@ wheels = [
 
 [[package]]
 name = "tb-agent"
-version = "0.7.3"
+version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -730,7 +730,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.28,<1" },
-    { name = "openai-codex", specifier = ">=0.1,<1" },
+    { name = "openai-codex", specifier = ">=0.14.4,<1" },
     { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "pydantic-settings", specifier = ">=2.12,<3" },
 ]

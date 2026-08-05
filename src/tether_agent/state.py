@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import stat
@@ -132,6 +133,7 @@ class StateStore:
                     thread_id TEXT,
                     state TEXT NOT NULL,
                     worktree_path TEXT,
+                    pending_result TEXT,
                     updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS worktrees (
@@ -191,6 +193,12 @@ class StateStore:
                 connection.execute(
                     "ALTER TABLE worktrees ADD COLUMN repository_path TEXT"
                 )
+            run_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+            }
+            if "pending_result" not in run_columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN pending_result TEXT")
             setup_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -858,6 +866,42 @@ class StateStore:
             connection.execute(
                 "UPDATE runs SET thread_id = ?, updated_at = ? WHERE run_id = ?",
                 (thread_id, datetime.now(UTC).isoformat(), str(run_id)),
+            )
+
+    def pending_result(self, run_id: UUID) -> dict[str, object] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT pending_result FROM runs WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+        if row is None or not row["pending_result"]:
+            return None
+        value = json.loads(str(row["pending_result"]))
+        return value if isinstance(value, dict) else None
+
+    def pending_result_run_ids(self) -> list[UUID]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT run_id FROM runs WHERE pending_result IS NOT NULL"
+            ).fetchall()
+        return [UUID(str(row["run_id"])) for row in rows]
+
+    def save_pending_result(self, run_id: UUID, result: dict[str, object]) -> None:
+        with self.connection(immediate=True) as connection:
+            connection.execute(
+                "UPDATE runs SET pending_result = ?, updated_at = ? WHERE run_id = ?",
+                (
+                    json.dumps(result, separators=(",", ":"), sort_keys=True),
+                    datetime.now(UTC).isoformat(),
+                    str(run_id),
+                ),
+            )
+
+    def clear_pending_result(self, run_id: UUID) -> None:
+        with self.connection(immediate=True) as connection:
+            connection.execute(
+                "UPDATE runs SET pending_result = NULL, updated_at = ? WHERE run_id = ?",
+                (datetime.now(UTC).isoformat(), str(run_id)),
             )
 
     def finish_run(self, run_id: UUID, state: str) -> None:

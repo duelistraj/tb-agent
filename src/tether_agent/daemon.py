@@ -526,6 +526,8 @@ class AgentDaemon:
             progress_number = 0
             progress_last_sent_at = 0.0
             progress_last_fingerprint: str | None = None
+            usage_sequence = 0
+            usage_supported = True
 
             async def progress(
                 message: str,
@@ -563,6 +565,39 @@ class AgentDaemon:
                 progress_last_fingerprint = fingerprint
                 progress_last_sent_at = now
 
+            async def token_usage(payload: dict[str, Any]) -> None:
+                nonlocal usage_sequence, usage_supported
+                if not usage_supported:
+                    return
+                usage_sequence += 1
+                try:
+                    await self.api.token_usage(
+                        run_id,
+                        generation,
+                        lease_token,
+                        usage_sequence,
+                        payload,
+                    )
+                except AgentApiError as exc:
+                    if exc.response.status_code in {404, 405}:
+                        usage_supported = False
+                        logger.info(
+                            "Server does not support live token usage for run %s",
+                            run_id,
+                        )
+                        return
+                    logger.warning(
+                        "Could not report live token usage for run %s: %s",
+                        run_id,
+                        exc,
+                    )
+                except httpx.TransportError as exc:
+                    logger.warning(
+                        "Could not report live token usage for run %s: %s",
+                        run_id,
+                        exc,
+                    )
+
             if pending_result is None:
                 assert directory is not None and local_context is not None
                 runtime_task = asyncio.create_task(
@@ -574,6 +609,7 @@ class AgentDaemon:
                         reasoning_effort=reasoning_effort,
                         environment=(namespace.environment() if namespace else {}),
                         progress=progress,
+                        token_usage=token_usage,
                     )
                 )
                 completed, _ = await asyncio.wait(

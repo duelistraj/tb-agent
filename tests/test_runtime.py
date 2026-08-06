@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -6,11 +7,13 @@ from typing import Any
 
 from tether_agent.runtime import (
     RESULT_SCHEMA,
+    TokenUsageReporter,
     _child_environment,
     _final_response_from_items,
     _item_activity,
     _parse_result,
     _repository_relative_path,
+    _token_usage_payload,
 )
 
 
@@ -158,3 +161,59 @@ def test_final_response_prefers_the_final_answer() -> None:
     ]
 
     assert _final_response_from_items(items) == '{"status":"completed"}'
+
+
+def test_codex_token_usage_notification_maps_to_remote_safe_counters() -> None:
+    breakdown = SimpleNamespace(
+        cached_input_tokens=2,
+        input_tokens=10,
+        output_tokens=4,
+        reasoning_output_tokens=3,
+        total_tokens=17,
+    )
+    payload = SimpleNamespace(
+        token_usage=SimpleNamespace(
+            last=breakdown,
+            total=breakdown,
+            model_context_window=200_000,
+        )
+    )
+
+    assert _token_usage_payload(payload) == {
+        "last": {
+            "cached_input_tokens": 2,
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 3,
+            "total_tokens": 17,
+        },
+        "total": {
+            "cached_input_tokens": 2,
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 3,
+            "total_tokens": 17,
+        },
+        "model_context_window": 200_000,
+    }
+
+
+def test_token_usage_reporter_coalesces_updates_and_flushes_latest() -> None:
+    sent: list[dict[str, Any]] = []
+    now = [0.0]
+
+    async def report(payload: dict[str, Any]) -> None:
+        sent.append(payload)
+
+    reporter = TokenUsageReporter(report, clock=lambda: now[0])
+    asyncio.run(reporter.observe({"total": 1}))
+    now[0] = 0.5
+    asyncio.run(reporter.observe({"total": 2}))
+    now[0] = 1.5
+    asyncio.run(reporter.observe({"total": 3}))
+
+    assert sent == [{"total": 1}]
+
+    asyncio.run(reporter.flush())
+
+    assert sent == [{"total": 1}, {"total": 3}]

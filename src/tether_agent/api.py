@@ -230,6 +230,27 @@ class TetherApi:
         )
         response.raise_for_status()
 
+    async def token_usage(
+        self,
+        run_id: UUID,
+        generation: int,
+        lease_token: str,
+        sequence: int,
+        payload: dict[str, Any],
+    ) -> None:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/token-usage",
+            json={
+                "generation": generation,
+                "lease_token": lease_token,
+                "sequence": sequence,
+                **payload,
+            },
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+
     async def comment(
         self,
         run_id: UUID,

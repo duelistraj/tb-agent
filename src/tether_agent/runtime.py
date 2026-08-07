@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import Awaitable, Callable
 from importlib.metadata import version
 from pathlib import Path
@@ -19,6 +20,8 @@ from tether_agent.config import RuntimeAdapterSettings
 from tether_agent.state import StateStore
 
 ProgressCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
+TokenUsageCallback = Callable[[dict[str, Any]], Awaitable[None]]
+TOKEN_USAGE_REPORT_INTERVAL_SECONDS = 2.0
 DAEMON_SECRET_ENVIRONMENT_KEYS = frozenset(
     {
         "TETHER_AGENT_ACCESS_TOKEN",
@@ -41,6 +44,80 @@ def _child_environment(overrides: dict[str, str]) -> dict[str, str]:
 def _enum_value(value: Any) -> str | None:
     raw = getattr(value, "value", value)
     return str(raw) if raw is not None else None
+
+
+def _token_usage_breakdown(value: Any) -> dict[str, int] | None:
+    field_by_wire_name = {
+        "cached_input_tokens": "cached_input_tokens",
+        "input_tokens": "input_tokens",
+        "output_tokens": "output_tokens",
+        "reasoning_output_tokens": "reasoning_output_tokens",
+        "total_tokens": "total_tokens",
+    }
+    breakdown = {
+        wire_name: getattr(value, attribute_name, None)
+        for wire_name, attribute_name in field_by_wire_name.items()
+    }
+    if not all(isinstance(item, int) and item >= 0 for item in breakdown.values()):
+        return None
+    if breakdown["cached_input_tokens"] > breakdown["input_tokens"]:
+        return None
+    return breakdown
+
+
+def _token_usage_payload(value: Any) -> dict[str, Any] | None:
+    usage = getattr(value, "token_usage", None)
+    last = _token_usage_breakdown(getattr(usage, "last", None))
+    total = _token_usage_breakdown(getattr(usage, "total", None))
+    context_window = getattr(usage, "model_context_window", None)
+    if last is None or total is None:
+        return None
+    if context_window is not None and (
+        not isinstance(context_window, int) or context_window < 1
+    ):
+        return None
+    return {
+        "last": last,
+        "total": total,
+        "model_context_window": context_window,
+    }
+
+
+class TokenUsageReporter:
+    def __init__(
+        self,
+        callback: TokenUsageCallback,
+        *,
+        interval_seconds: float = TOKEN_USAGE_REPORT_INTERVAL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.callback = callback
+        self.interval_seconds = interval_seconds
+        self.clock = clock
+        self.pending: dict[str, Any] | None = None
+        self.last_sent_at: float | None = None
+
+    async def observe(self, payload: dict[str, Any]) -> None:
+        self.pending = payload
+        now = self.clock()
+        if (
+            self.last_sent_at is not None
+            and now - self.last_sent_at < self.interval_seconds
+        ):
+            return
+        await self._send(now)
+
+    async def flush(self) -> None:
+        if self.pending is not None:
+            await self._send(self.clock())
+
+    async def _send(self, sent_at: float) -> None:
+        payload = self.pending
+        if payload is None:
+            return
+        await self.callback(payload)
+        self.pending = None
+        self.last_sent_at = sent_at
 
 
 def _repository_relative_path(path: str, working_directory: Path) -> str | None:
@@ -224,6 +301,7 @@ class RuntimeAdapter(Protocol):
         reasoning_effort: str | None,
         environment: dict[str, str],
         progress: ProgressCallback,
+        token_usage: TokenUsageCallback,
     ) -> dict[str, Any]: ...
 
 
@@ -399,6 +477,7 @@ class CodexRuntime:
         reasoning_effort: str | None,
         environment: dict[str, str],
         progress: ProgressCallback,
+        token_usage: TokenUsageCallback,
     ) -> dict[str, Any]:
         prompt = self._prompt(context)
         await progress(
@@ -451,6 +530,7 @@ class CodexRuntime:
             )
             items: list[Any] = []
             turn_error: str | None = None
+            usage_reporter = TokenUsageReporter(token_usage)
             async for notification in turn.stream():
                 payload = notification.payload
                 if notification.method in {"item/started", "item/completed"}:
@@ -496,6 +576,10 @@ class CodexRuntime:
                             "milestone": False,
                         },
                     )
+                elif notification.method == "thread/tokenUsage/updated":
+                    usage_payload = _token_usage_payload(payload)
+                    if usage_payload is not None:
+                        await usage_reporter.observe(usage_payload)
                 elif notification.method == "turn/completed":
                     completed_turn = getattr(payload, "turn", None)
                     status_value = _enum_value(getattr(completed_turn, "status", None))
@@ -504,6 +588,7 @@ class CodexRuntime:
                         turn_error = str(
                             getattr(error, "message", None) or "Codex turn failed"
                         )
+            await usage_reporter.flush()
             if turn_error is not None:
                 raise RuntimeError(turn_error)
             final_response = _final_response_from_items(items)
@@ -613,8 +698,9 @@ class CommandRuntime:
         reasoning_effort: str | None,
         environment: dict[str, str],
         progress: ProgressCallback,
+        token_usage: TokenUsageCallback,
     ) -> dict[str, Any]:
-        del run_id
+        del run_id, token_usage
         prompt = CodexRuntime._prompt(context) + (
             "\n\nReturn only one JSON object matching this JSON Schema:\n"
             f"{json.dumps(RESULT_SCHEMA, ensure_ascii=False)}"

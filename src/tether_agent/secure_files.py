@@ -66,6 +66,46 @@ def validate_private_file(path: Path, *, allow_missing: bool = True) -> None:
         raise PermissionError(f"Private file permissions must be 0600: {path}")
 
 
+def harden_private_file(path: Path, *, allow_missing: bool = True) -> None:
+    """Restrict an existing, user-owned regular file to the private file mode."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if allow_missing:
+            return
+        raise FileNotFoundError(path)
+    if stat.S_ISLNK(metadata.st_mode):
+        raise PermissionError(f"Refusing to use symlinked private file: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PermissionError(f"Private path is not a regular file: {path}")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise PermissionError(f"Private file is not owned by the current user: {path}")
+    if os.name == "nt":
+        return
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened_metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_metadata.st_mode):
+            raise PermissionError(f"Private path is not a regular file: {path}")
+        if hasattr(os, "getuid") and opened_metadata.st_uid != os.getuid():
+            raise PermissionError(
+                f"Private file is not owned by the current user: {path}"
+            )
+        if (opened_metadata.st_dev, opened_metadata.st_ino) != (
+            metadata.st_dev,
+            metadata.st_ino,
+        ):
+            raise PermissionError(f"Private file changed while securing it: {path}")
+        secure_descriptor(descriptor, path)
+    finally:
+        os.close(descriptor)
+    validate_private_file(path, allow_missing=False)
+
+
 def atomic_write(
     path: Path,
     content: bytes,

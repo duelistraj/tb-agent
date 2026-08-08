@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TextIO
 from uuid import UUID, uuid4
 
 import httpx
@@ -52,7 +53,8 @@ from tether_agent.repositories import (
 from tether_agent.secure_files import (
     FILE_MODE,
     ensure_private_directory,
-    validate_private_file,
+    harden_private_file,
+    secure_descriptor,
 )
 from tether_agent.services import ServiceManager
 from tether_agent.state import StateStore
@@ -73,6 +75,8 @@ AUTH_ENV_KEYS = frozenset(
     }
 )
 CONFIGURATION_ENV_KEYS = MUTABLE_ENV_KEYS
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 
 
 class _RedactTokenFilter(logging.Filter):
@@ -87,9 +91,31 @@ class _RedactTokenFilter(logging.Filter):
 _RedactPatFilter = _RedactTokenFilter
 
 
+class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    def _open(self) -> TextIO:
+        path = Path(self.baseFilename)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, FILE_MODE)
+        try:
+            secure_descriptor(descriptor, path)
+            return os.fdopen(
+                descriptor,
+                self.mode,
+                encoding=self.encoding,
+                errors=self.errors,
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+
 def _configure_logging(paths: ProfilePaths) -> None:
     ensure_private_directory(paths.state_dir)
-    validate_private_file(paths.log_file)
+    for backup_index in range(LOG_BACKUP_COUNT + 1):
+        suffix = "" if backup_index == 0 else f".{backup_index}"
+        harden_private_file(Path(f"{paths.log_file}{suffix}"))
     if not paths.log_file.exists():
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
@@ -99,13 +125,12 @@ def _configure_logging(paths: ProfilePaths) -> None:
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     stream = logging.StreamHandler()
     stream.setFormatter(formatter)
-    file_handler = logging.handlers.RotatingFileHandler(
+    file_handler = _PrivateRotatingFileHandler(
         paths.log_file,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=3,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
         encoding="utf-8",
     )
-    paths.log_file.chmod(0o600)
     file_handler.setFormatter(formatter)
     redactor = _RedactTokenFilter()
     stream.addFilter(redactor)

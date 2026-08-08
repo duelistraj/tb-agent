@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.9.2 - 2026-08-08
+
+### Fixed
+
+- Repair permissions on existing agent-owned daemon logs during startup and create every rotated log with mode `0600`.
+- Continue rejecting symlinked, non-regular, and foreign-owned daemon log files instead of modifying them.
+
 ## 0.7.2 - 2026-08-05
 
 ### Changed

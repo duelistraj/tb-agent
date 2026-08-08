@@ -232,6 +232,13 @@ class StateStore:
                     method TEXT,
                     applied_commit TEXT,
                     error TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at TEXT,
+                    next_retry_at TEXT,
+                    last_error_code TEXT,
+                    last_error_message TEXT,
+                    retry_revision INTEGER NOT NULL DEFAULT 0,
+                    consumed_retry_revision INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -300,6 +307,24 @@ class StateStore:
                 connection.execute("ALTER TABLE runs ADD COLUMN pending_result TEXT")
             if "worker_slot" not in run_columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN worker_slot INTEGER")
+            handoff_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(handoffs)").fetchall()
+            }
+            handoff_column_definitions = {
+                "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "last_attempt_at": "TEXT",
+                "next_retry_at": "TEXT",
+                "last_error_code": "TEXT",
+                "last_error_message": "TEXT",
+                "retry_revision": "INTEGER NOT NULL DEFAULT 0",
+                "consumed_retry_revision": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column_name, definition in handoff_column_definitions.items():
+                if column_name not in handoff_columns:
+                    connection.execute(
+                        f"ALTER TABLE handoffs ADD COLUMN {column_name} {definition}"
+                    )
             setup_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -1193,8 +1218,11 @@ class StateStore:
                     captured_index_digest = excluded.captured_index_digest,
                     method = excluded.method,
                     error = NULL,
+                    next_retry_at = NULL,
+                    last_error_code = NULL,
+                    last_error_message = NULL,
                     updated_at = excluded.updated_at
-                WHERE handoffs.state = 'retry_requested'
+                WHERE handoffs.state IN ('retry_requested', 'retry_scheduled')
                 """,
                 (
                     str(run_id),
@@ -1245,6 +1273,91 @@ class StateStore:
             if cursor.rowcount != 1:
                 raise RuntimeError("Only a blocked handoff can be retried")
 
+    def schedule_handoff_retry(
+        self,
+        run_id: UUID,
+        *,
+        attempt_count: int,
+        next_retry_at: datetime | None,
+        error_code: str,
+        error_message: str,
+        retryable: bool = True,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connection(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO handoffs(
+                    run_id, state, snapshot_commit, snapshot_tree,
+                    validation_revision, change_set_revision, checkout_path,
+                    common_directory, attempt_count, last_attempt_at,
+                    next_retry_at, last_error_code, last_error_message,
+                    created_at, updated_at
+                )
+                SELECT
+                    ?, ?, accepted_snapshot_commit,
+                    accepted_snapshot_tree, validation_revision,
+                    change_set_revision, repository_path, repository_path,
+                    ?, ?, ?, ?, ?, ?, ?
+                FROM change_sets WHERE run_id = ?
+                ON CONFLICT(run_id) DO UPDATE SET
+                    state = CASE
+                        WHEN handoffs.state IN ('applying', 'applied', 'blocked')
+                            THEN handoffs.state
+                        ELSE excluded.state
+                    END,
+                    attempt_count = excluded.attempt_count,
+                    last_attempt_at = excluded.last_attempt_at,
+                    next_retry_at = excluded.next_retry_at,
+                    last_error_code = excluded.last_error_code,
+                    last_error_message = excluded.last_error_message,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(run_id),
+                    "retry_scheduled" if retryable else "blocked",
+                    attempt_count,
+                    now,
+                    next_retry_at.isoformat() if next_retry_at is not None else None,
+                    error_code,
+                    error_message[:512],
+                    now,
+                    now,
+                    str(run_id),
+                ),
+            )
+
+    def handoff_retry_due(self, run_id: UUID, *, now: datetime) -> bool:
+        row = self.handoff(run_id)
+        if row is None:
+            return True
+        next_retry_at = row["next_retry_at"]
+        return (
+            next_retry_at is None or datetime.fromisoformat(str(next_retry_at)) <= now
+        )
+
+    def consume_remote_handoff_retry(self, run_id: UUID, retry_revision: int) -> bool:
+        with self.connection(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT consumed_retry_revision FROM handoffs WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            consumed = int(row["consumed_retry_revision"]) if row is not None else 0
+            if retry_revision <= consumed:
+                return False
+            connection.execute(
+                """
+                UPDATE handoffs
+                SET consumed_retry_revision = ?, next_retry_at = NULL,
+                    state = CASE WHEN state IN ('retry_scheduled', 'blocked')
+                        THEN 'retry_requested' ELSE state END,
+                    updated_at = ?
+                WHERE run_id = ?
+                """,
+                (retry_revision, datetime.now(UTC).isoformat(), str(run_id)),
+            )
+            return True
+
     def finish_handoff(
         self,
         run_id: UUID,
@@ -1268,7 +1381,9 @@ class StateStore:
             connection.execute(
                 """
                 UPDATE handoffs
-                SET state = ?, applied_commit = ?, error = ?, updated_at = ?
+                SET state = ?, applied_commit = ?, error = ?,
+                    next_retry_at = NULL, last_error_code = NULL,
+                    last_error_message = NULL, updated_at = ?
                 WHERE run_id = ?
                 """,
                 (

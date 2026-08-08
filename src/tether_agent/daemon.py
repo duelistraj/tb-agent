@@ -9,7 +9,7 @@ import re
 import subprocess
 import time
 from contextlib import suppress
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -33,6 +33,7 @@ from tether_agent.worktrees import WorktreeManager
 
 logger = logging.getLogger(__name__)
 CONTROL_PLANE_INTERVAL_SECONDS = 25
+HANDOFF_RETRY_DELAYS_SECONDS = (5, 15, 30, 60, 120, 300)
 ACKNOWLEDGED_RESULT_STATES = frozenset(
     {"completion_pending", "review", "completed", "failed", "cancelled"}
 )
@@ -804,56 +805,171 @@ class AgentDaemon:
         if self.installation_id is None:
             return
         for remote_run in await self.api.pending_handoffs(self.installation_id):
-            run_id = UUID(str(remote_run["id"]))
-            remote_change_set = remote_run.get("change_set")
-            if not isinstance(remote_change_set, dict):
-                continue
-            binding = {
-                "run_id": str(run_id),
-                "snapshot_commit": remote_change_set["snapshot_commit"],
-                "snapshot_tree": remote_change_set["snapshot_tree"],
-                "validation_revision": remote_change_set["validation_revision"],
-                "change_set_revision": remote_change_set["change_set_revision"],
-            }
-            local = self.store.change_set(run_id)
-            if local is None:
-                logger.error("Accepted run %s has no local change set", run_id)
-                continue
-            if remote_run["state"] == "awaiting_acknowledgement":
-                reason = (remote_run.get("pending_completion") or {}).get("reason")
-                if reason != "handoff_ack_pending":
-                    continue
-                if local.state == "accepted":
-                    local = self.store.transition_change_set(
-                        run_id,
-                        expected_states=frozenset({"accepted"}),
-                        next_state="applied",
-                    )
-                await self.api.acknowledge_handoff(run_id, binding)
-                self.ports.release(run_id)
-                continue
-            if remote_run["state"] == "handoff_blocked":
-                handoff = self.store.handoff(run_id)
-                if handoff is None or handoff["state"] != "retry_requested":
-                    continue
-            if local.state == "review_ready":
-                local = self.store.accept_change_set(
-                    run_id=run_id,
-                    snapshot_commit=str(binding["snapshot_commit"]),
-                    snapshot_tree=str(binding["snapshot_tree"]),
-                    validation_revision=int(binding["validation_revision"]),
-                    change_set_revision=int(binding["change_set_revision"]),
+            try:
+                await self._reconcile_handoff(remote_run)
+            except (AgentApiError, httpx.HTTPError, OSError) as error:
+                await self._record_handoff_failure(remote_run, error)
+            except (RuntimeError, subprocess.SubprocessError) as error:
+                logger.error(
+                    "Handoff %s requires local attention: %s",
+                    remote_run.get("id", "unknown"),
+                    self._remote_safe(str(error)),
                 )
+
+    async def _record_handoff_failure(
+        self,
+        remote_run: dict[str, Any],
+        error: Exception,
+    ) -> None:
+        run_id = UUID(str(remote_run["id"]))
+        remote_change_set = remote_run.get("change_set")
+        if not isinstance(remote_change_set, dict):
+            return
+        current = self.store.handoff(run_id)
+        attempt_count = (
+            int(current["attempt_count"]) if current is not None else 0
+        ) + 1
+        recoverable = not isinstance(error, AgentApiError) or error.recoverable
+        retry_index = min(attempt_count - 1, len(HANDOFF_RETRY_DELAYS_SECONDS) - 1)
+        jitter = 0.9 + ((run_id.int + attempt_count) % 21) / 100
+        next_retry_at = (
+            datetime.now(UTC)
+            + timedelta(seconds=HANDOFF_RETRY_DELAYS_SECONDS[retry_index] * jitter)
+            if recoverable
+            else None
+        )
+        message = self._remote_safe(
+            error.user_message if isinstance(error, AgentApiError) else str(error)
+        )
+        error_code = "server_transient" if recoverable else "unknown"
+        self.store.schedule_handoff_retry(
+            run_id,
+            attempt_count=attempt_count,
+            next_retry_at=next_retry_at,
+            error_code=error_code,
+            error_message=str(message),
+            retryable=recoverable,
+        )
+        if recoverable and next_retry_at is not None:
+            binding = self._handoff_binding(run_id, remote_change_set)
+            try:
+                await self.api.report_handoff_status(
+                    run_id,
+                    {
+                        **binding,
+                        "attempt_count": attempt_count,
+                        "error_code": error_code,
+                        "error_message": str(message),
+                        "next_retry_at": next_retry_at.isoformat(),
+                    },
+                )
+            except (AgentApiError, httpx.HTTPError) as report_error:
+                logger.debug(
+                    "Could not report handoff retry %s: %s",
+                    run_id,
+                    report_error,
+                )
+        logger.warning(
+            "Handoff %s %s: %s",
+            run_id,
+            "will retry" if recoverable else "is blocked",
+            message,
+        )
+
+    @staticmethod
+    def _handoff_binding(
+        run_id: UUID,
+        remote_change_set: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "run_id": str(run_id),
+            "snapshot_commit": remote_change_set.get("accepted_snapshot_commit")
+            or remote_change_set["snapshot_commit"],
+            "snapshot_tree": remote_change_set.get("accepted_snapshot_tree")
+            or remote_change_set["snapshot_tree"],
+            "validation_revision": remote_change_set.get("accepted_validation_revision")
+            if remote_change_set.get("accepted_validation_revision") is not None
+            else remote_change_set["validation_revision"],
+            "change_set_revision": remote_change_set.get("accepted_change_set_revision")
+            if remote_change_set.get("accepted_change_set_revision") is not None
+            else remote_change_set["change_set_revision"],
+        }
+
+    async def _reconcile_handoff(self, remote_run: dict[str, Any]) -> None:
+        run_id = UUID(str(remote_run["id"]))
+        remote_change_set = remote_run.get("change_set")
+        if not isinstance(remote_change_set, dict):
+            return
+        binding = self._handoff_binding(run_id, remote_change_set)
+        local = self.store.change_set(run_id)
+        if local is None:
+            logger.error("Accepted run %s has no local change set", run_id)
+            return
+        remote_status = remote_run.get("handoff_status") or {}
+        remote_retry_revision = int(remote_status.get("retry_revision") or 0)
+        if remote_retry_revision:
+            self.store.consume_remote_handoff_retry(run_id, remote_retry_revision)
+        handoff = self.store.handoff(run_id)
+        if handoff is not None and not self.store.handoff_retry_due(
+            run_id, now=datetime.now(UTC)
+        ):
+            return
+        if remote_run["state"] == "awaiting_acknowledgement":
+            reason = (remote_run.get("pending_completion") or {}).get("reason")
+            if reason != "handoff_ack_pending":
+                return
+            if local.state == "accepted":
+                self.store.transition_change_set(
+                    run_id,
+                    expected_states=frozenset({"accepted"}),
+                    next_state="applied",
+                )
+            await self.api.acknowledge_handoff(run_id, binding)
+            self.ports.release(run_id)
+            return
+        if local.state == "review_ready":
+            local = self.store.accept_change_set(
+                run_id=run_id,
+                snapshot_commit=str(binding["snapshot_commit"]),
+                snapshot_tree=str(binding["snapshot_tree"]),
+                validation_revision=int(binding["validation_revision"]),
+                change_set_revision=int(binding["change_set_revision"]),
+            )
+        handoff = self.store.handoff(run_id)
+        if remote_run["state"] == "handoff_blocked" and (
+            handoff is None or handoff["state"] not in {"retry_requested", "applied"}
+        ):
+            return
+        if handoff is not None and handoff["state"] == "blocked":
+            if remote_run["state"] == "applying":
+                await self.api.complete_handoff(
+                    run_id,
+                    {
+                        **binding,
+                        "status": "blocked",
+                        "message": self._remote_safe(
+                            str(handoff["error"] or handoff["last_error_message"])
+                        ),
+                    },
+                )
+            return
+        if remote_run["state"] in {"accepted", "handoff_blocked"}:
+            response = await self.api.start_handoff(run_id, binding)
+            if response.get("state") == "handoff_blocked":
+                return
+        handoff = self.store.handoff(run_id)
+        if handoff is not None and handoff["state"] == "applied":
+            result_method = str(handoff["method"])
+            applied_commit = str(handoff["applied_commit"])
+        else:
             if local.state != "accepted":
                 logger.error(
                     "Accepted server handoff %s conflicts with local state %s",
                     run_id,
                     local.state,
                 )
-                continue
+                return
             try:
-                if remote_run["state"] in {"accepted", "handoff_blocked"}:
-                    await self.api.start_handoff(run_id, binding)
                 result = apply_accepted_snapshot(
                     store=self.store,
                     change_set=local,
@@ -868,26 +984,29 @@ class AgentDaemon:
                         "message": self._remote_safe(str(error)),
                     },
                 )
-                continue
-            response = await self.api.complete_handoff(
-                run_id,
-                {
-                    **binding,
-                    "status": "applied",
-                    "method": result.method,
-                    "applied_commit": result.applied_commit,
-                },
-            )
-            local = self.store.transition_change_set(
+                return
+            result_method = result.method
+            applied_commit = result.applied_commit
+        response = await self.api.complete_handoff(
+            run_id,
+            {
+                **binding,
+                "status": "applied",
+                "method": result_method,
+                "applied_commit": applied_commit,
+            },
+        )
+        if local.state == "accepted":
+            self.store.transition_change_set(
                 run_id,
                 expected_states=frozenset({"accepted"}),
                 next_state="applied",
             )
-            if (response.get("pending_completion") or {}).get("reason") == (
-                "handoff_ack_pending"
-            ):
-                await self.api.acknowledge_handoff(run_id, binding)
-                self.ports.release(run_id)
+        if (response.get("pending_completion") or {}).get("reason") == (
+            "handoff_ack_pending"
+        ):
+            await self.api.acknowledge_handoff(run_id, binding)
+            self.ports.release(run_id)
 
     async def _reconcile_change_set_integrity(self) -> None:
         for record in self.store.change_sets():

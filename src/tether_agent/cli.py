@@ -871,7 +871,8 @@ def command_changes_list(args: argparse.Namespace, paths: ProfilePaths) -> int:
 
 
 def command_changes_status(args: argparse.Namespace, paths: ProfilePaths) -> int:
-    record = require_change_set(StateStore(paths.state_file), args.run_id)
+    store = StateStore(paths.state_file)
+    record = require_change_set(store, args.run_id)
     print(f"Run: {record.run_id}")
     print(f"State: {record.state}")
     print(f"Base commit: {record.base_commit}")
@@ -880,6 +881,12 @@ def command_changes_status(args: argparse.Namespace, paths: ProfilePaths) -> int
     print(f"Change-set revision: {record.change_set_revision}")
     print(f"Validation revision: {record.validation_revision}")
     print(f"Validation: {record.validation_status}")
+    handoff = store.handoff(args.run_id)
+    if handoff is not None:
+        print(f"Handoff state: {str(handoff['state']).replace('_', ' ')}")
+        print(f"Handoff attempts: {int(handoff['attempt_count'])}")
+        print(f"Next retry: {handoff['next_retry_at'] or 'none'}")
+        print(f"Last handoff error: {handoff['last_error_message'] or 'none'}")
     if record.state == "legacy_manual_review_required":
         print(
             "Automatic snapshot and application are disabled. Inspect this worktree, "

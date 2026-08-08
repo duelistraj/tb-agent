@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.9.3 - 2026-08-08
+
+### Fixed
+
+- Persist bounded local Git handoff retries so daemon restarts and transient server failures resume without applying an accepted snapshot twice.
+- Recover when Git was applied locally but the completion response was lost, while keeping blocked handoffs isolated from other pending results.
+- Show handoff attempts, retry timing, and safe failure details through `tb-agent changes status`.
+
 ## 0.9.2 - 2026-08-08
 
 ### Fixed

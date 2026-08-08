@@ -245,6 +245,8 @@ def _capabilities(config: ProfileConfig, store: StateStore) -> dict[str, Any]:
         "shell": True,
         "git": True,
         "network": config.allow_network,
+        "per_run_branch_handoff": True,
+        "remote_pr_publication": True,
         "writable_roots": [
             mapping.security_revision()
             for mapping in config.project_mappings

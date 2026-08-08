@@ -264,10 +264,11 @@ def _mapping_from_arguments(args: argparse.Namespace) -> ProjectMapping | None:
         if (
             args.project_id is not None
             or args.remote is not None
+            or args.remote_name is not None
             or args.allow_no_remote
         ):
             raise RuntimeError(
-                "--project-id, --remote, and --allow-no-remote require --path"
+                "--project-id, --remote-name, --remote, and --allow-no-remote require --path"
             )
         return None
     project_id = args.project_id
@@ -279,6 +280,7 @@ def _mapping_from_arguments(args: argparse.Namespace) -> ProjectMapping | None:
     repository = inspect_repository(
         args.path,
         remote=args.remote,
+        remote_name=getattr(args, "remote_name", None),
         allow_no_remote=args.allow_no_remote,
     )
     return ProjectMapping(
@@ -286,6 +288,7 @@ def _mapping_from_arguments(args: argparse.Namespace) -> ProjectMapping | None:
         local_path=repository.root,
         access="write",
         remote_url=repository.remote_url,
+        remote_name=repository.remote_name,
     )
 
 
@@ -298,6 +301,7 @@ def _repository_for_existing_init(
     repository = inspect_repository(
         args.path,
         remote=args.remote,
+        remote_name=args.remote_name,
         allow_no_remote=args.allow_no_remote,
     )
     mapping = next(
@@ -323,6 +327,8 @@ def _validate_preserved_mappings(config: ProfileConfig) -> None:
     for mapping in config.project_mappings:
         repository = inspect_repository(
             mapping.local_path,
+            remote=mapping.remote_url,
+            remote_name=mapping.remote_name,
             allow_no_remote=mapping.remote_url is None,
         )
         if repository.root != mapping.local_path:
@@ -540,6 +546,7 @@ def _initialize_existing_profile(args: argparse.Namespace, paths: ProfilePaths) 
             path=args.path,
             project_id=args.project_id,
             remote=args.remote,
+            remote_name=args.remote_name,
             allow_no_remote=args.allow_no_remote,
             setup_reference=None,
             access="write",
@@ -596,6 +603,7 @@ def _initialize_profile(args: argparse.Namespace, paths: ProfilePaths) -> int:
         deferred_repository = inspect_repository(
             args.path,
             remote=args.remote,
+            remote_name=args.remote_name,
             allow_no_remote=args.allow_no_remote,
         )
         if deferred_repository.remote_url is None:
@@ -887,6 +895,12 @@ def command_changes_status(args: argparse.Namespace, paths: ProfilePaths) -> int
         print(f"Handoff attempts: {int(handoff['attempt_count'])}")
         print(f"Next retry: {handoff['next_retry_at'] or 'none'}")
         print(f"Last handoff error: {handoff['last_error_message'] or 'none'}")
+    run_branch = store.run_branch(args.run_id)
+    if run_branch is not None:
+        print(f"Feature branch: {run_branch.branch_name}")
+        print(f"Upstream: {run_branch.upstream_ref}")
+        print(f"Branch state: {run_branch.state.replace('_', ' ')}")
+        print(f"Feature head: {run_branch.feature_head}")
     if record.state == "legacy_manual_review_required":
         print(
             "Automatic snapshot and application are disabled. Inspect this worktree, "
@@ -899,6 +913,43 @@ def command_changes_diff(args: argparse.Namespace, paths: ProfilePaths) -> int:
     record = require_change_set(StateStore(paths.state_file), args.run_id)
     print(snapshot_diff(record) or "No file changes.")
     return 0
+
+
+def command_changes_path(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    record = require_change_set(StateStore(paths.state_file), args.run_id)
+    print(record.worktree_path)
+    return 0
+
+
+def command_changes_publication(args: argparse.Namespace, paths: ProfilePaths) -> int:
+    settings = load_effective_settings(paths)
+    daemon = AgentDaemon(settings, paths=paths)
+
+    async def reconcile() -> dict:
+        try:
+            remote = await daemon.api.run(args.run_id)
+            publication = remote.get("publication_status")
+            if publication is None:
+                raise RuntimeError(
+                    "Publication has not been approved. Use Publish pull request "
+                    "on the accepted task in Tether Brain first."
+                )
+            await daemon._reconcile_publication(remote)
+            return await daemon.api.run(args.run_id)
+        finally:
+            await daemon.api.close()
+
+    result = asyncio.run(reconcile())
+    publication = result.get("publication_status") or {}
+    print(
+        "Publication state: "
+        f"{str(publication.get('state', 'unknown')).replace('_', ' ')}"
+    )
+    if publication.get("branch_name"):
+        print(f"Branch: {publication['branch_name']}")
+    if publication.get("pull_request_url"):
+        print(f"Pull request: {publication['pull_request_url']}")
+    return 0 if publication.get("state") in {"published", "merged", "cleaned"} else 1
 
 
 def command_changes_test(args: argparse.Namespace, paths: ProfilePaths) -> int:
@@ -979,13 +1030,25 @@ def command_changes_apply(args: argparse.Namespace, paths: ProfilePaths) -> int:
 
     result = asyncio.run(apply_pending())
     print(f"Handoff state: {str(result.get('state', 'unknown')).replace('_', ' ')}")
-    return 0 if result.get("state") in {"completed", "awaiting_acknowledgement"} else 1
+    return (
+        0
+        if result.get("state")
+        in {
+            "awaiting_acknowledgement",
+            "publication_pending",
+            "publishing",
+            "publication_blocked",
+            "completed",
+        }
+        else 1
+    )
 
 
 def command_workspace_add(args: argparse.Namespace, paths: ProfilePaths) -> int:
     repository = inspect_repository(
         args.path,
         remote=args.remote,
+        remote_name=args.remote_name,
         allow_no_remote=args.allow_no_remote,
     )
     project_id = args.project_id
@@ -1096,6 +1159,7 @@ def command_workspace_add(args: argparse.Namespace, paths: ProfilePaths) -> int:
                     local_path=repository.root,
                     access=args.access,
                     remote_url=repository.remote_url,
+                    remote_name=repository.remote_name,
                 )
 
             manager.mutate(
@@ -1119,6 +1183,7 @@ def command_workspace_add(args: argparse.Namespace, paths: ProfilePaths) -> int:
         local_path=repository.root,
         access=args.access,
         remote_url=repository.remote_url,
+        remote_name=repository.remote_name,
     )
     manager = ProfileManager(paths)
     if (
@@ -1762,6 +1827,7 @@ def _add_repository_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project-id", type=UUID)
     parser.add_argument("--setup-reference")
     parser.add_argument("--remote")
+    parser.add_argument("--remote-name")
     parser.add_argument("--allow-no-remote", action="store_true")
 
 
@@ -1778,6 +1844,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--path", type=Path)
     init.add_argument("--project-id", type=UUID)
     init.add_argument("--remote")
+    init.add_argument("--remote-name")
     init.add_argument("--allow-no-remote", action="store_true")
     init.add_argument("--name")
     init.add_argument("--auth", choices=("oauth", "pat"), default="oauth")
@@ -1814,6 +1881,9 @@ def build_parser() -> argparse.ArgumentParser:
     changes_diff = changes_commands.add_parser("diff")
     changes_diff.add_argument("run_id", type=UUID)
     changes_diff.set_defaults(handler=command_changes_diff)
+    changes_path = changes_commands.add_parser("path")
+    changes_path.add_argument("run_id", type=UUID)
+    changes_path.set_defaults(handler=command_changes_path)
     changes_test = changes_commands.add_parser("test")
     changes_test.add_argument("run_id", type=UUID)
     changes_test.add_argument("test_command", nargs=argparse.REMAINDER)
@@ -1821,6 +1891,9 @@ def build_parser() -> argparse.ArgumentParser:
     changes_apply = changes_commands.add_parser("apply")
     changes_apply.add_argument("run_id", type=UUID)
     changes_apply.set_defaults(handler=command_changes_apply)
+    changes_publication = changes_commands.add_parser("publication")
+    changes_publication.add_argument("run_id", type=UUID)
+    changes_publication.set_defaults(handler=command_changes_publication)
 
     migrate = commands.add_parser("migrate")
     migrate_commands = migrate.add_subparsers(dest="migrate_command", required=True)

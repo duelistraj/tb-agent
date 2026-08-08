@@ -19,6 +19,7 @@ from openai_codex import CodexError
 
 from tether_agent import __version__
 from tether_agent.api import AgentApiError, TetherApi
+from tether_agent.branches import prepare_run_branch
 from tether_agent.changes import refresh_snapshot_state
 from tether_agent.config import DaemonSettings, load_effective_settings
 from tether_agent.handoff import apply_accepted_snapshot
@@ -26,6 +27,10 @@ from tether_agent.locking import LockUnavailable, ProfileLock
 from tether_agent.oauth import refresh_credential
 from tether_agent.paths import ProfilePaths
 from tether_agent.ports import PortAllocator, RunNamespace
+from tether_agent.publication import (
+    cleanup_merged_publication,
+    publish_github_pull_request,
+)
 from tether_agent.runtime import RuntimeRegistry
 from tether_agent.snapshots import create_snapshot, head_commit
 from tether_agent.state import StateStore
@@ -174,6 +179,8 @@ class AgentDaemon:
             "shell": True,
             "git": True,
             "network": self.settings.allow_network,
+            "per_run_branch_handoff": True,
+            "remote_pr_publication": True,
             "writable_roots": [
                 mapping.security_revision()
                 for mapping in self.settings.project_mappings
@@ -355,6 +362,7 @@ class AgentDaemon:
                         recovery_attempted = True
                     await self._reconcile_change_set_integrity()
                     await self._reconcile_handoffs()
+                    await self._reconcile_publications()
                     await self._reconcile_terminal_resources()
                     used_slots = set(slot_by_run.values())
                     available_slots = [
@@ -489,6 +497,8 @@ class AgentDaemon:
                     directory, local_context = self._prepare_projects(
                         context=context,
                         run_id=run_id,
+                        agent_name=str(run.get("profile_name") or "agent"),
+                        task_title=str(run.get("task_title") or "task"),
                     )
                 except RuntimeError as exc:
                     await self.api.comment(
@@ -987,6 +997,9 @@ class AgentDaemon:
                 return
             result_method = result.method
             applied_commit = result.applied_commit
+        run_branch = self.store.run_branch(run_id)
+        if run_branch is None:
+            raise RuntimeError("Accepted handoff has no locally owned run branch")
         response = await self.api.complete_handoff(
             run_id,
             {
@@ -994,6 +1007,9 @@ class AgentDaemon:
                 "status": "applied",
                 "method": result_method,
                 "applied_commit": applied_commit,
+                "branch_name": run_branch.branch_name,
+                "upstream_ref": run_branch.upstream_ref,
+                "base_commit": run_branch.base_commit,
             },
         )
         if local.state == "accepted":
@@ -1007,6 +1023,232 @@ class AgentDaemon:
         ):
             await self.api.acknowledge_handoff(run_id, binding)
             self.ports.release(run_id)
+
+    @staticmethod
+    def _publication_binding(remote_run: dict[str, Any]) -> dict[str, Any]:
+        change_set = remote_run["change_set"]
+        handoff = remote_run["handoff_status"]
+        return {
+            "run_id": str(remote_run["id"]),
+            "snapshot_commit": change_set.get("accepted_snapshot_commit")
+            or change_set["snapshot_commit"],
+            "snapshot_tree": change_set.get("accepted_snapshot_tree")
+            or change_set["snapshot_tree"],
+            "validation_revision": change_set.get("accepted_validation_revision")
+            if change_set.get("accepted_validation_revision") is not None
+            else change_set["validation_revision"],
+            "change_set_revision": change_set.get("accepted_change_set_revision")
+            if change_set.get("accepted_change_set_revision") is not None
+            else change_set["change_set_revision"],
+            "branch_name": handoff["branch_name"],
+            "upstream_ref": handoff["upstream_ref"],
+            "base_commit": handoff["base_commit"],
+        }
+
+    async def _reconcile_publications(self) -> None:
+        pending_publications = getattr(self.api, "pending_publications", None)
+        if self.installation_id is None or pending_publications is None:
+            return
+        for remote_run in await pending_publications(self.installation_id):
+            try:
+                await self._reconcile_publication(remote_run)
+            except (
+                AgentApiError,
+                httpx.HTTPError,
+                OSError,
+                RuntimeError,
+                subprocess.SubprocessError,
+            ) as error:
+                publication = remote_run.get("publication_status") or {}
+                if publication.get("state") in {"pushing", "creating_pr"}:
+                    binding = self._publication_binding(remote_run)
+                    try:
+                        await self.api.complete_publication(
+                            UUID(str(remote_run["id"])),
+                            {
+                                **binding,
+                                "status": "blocked",
+                                "error_code": "publication_failed",
+                                "error_message": str(self._remote_safe(str(error)))[
+                                    :512
+                                ],
+                                "remote_branch_present": publication.get(
+                                    "remote_branch_present"
+                                ),
+                                "ahead_count": publication.get("ahead_count"),
+                                "behind_count": publication.get("behind_count"),
+                                "handoff_retention_days": (
+                                    self.settings.worktrees.handoff_retention_days
+                                ),
+                            },
+                        )
+                    except (AgentApiError, httpx.HTTPError):
+                        pass
+                logger.error(
+                    "Publication %s requires attention: %s",
+                    remote_run.get("id", "unknown"),
+                    self._remote_safe(str(error)),
+                )
+
+    async def _reconcile_publication(self, remote_run: dict[str, Any]) -> None:
+        run_id = UUID(str(remote_run["id"]))
+        publication = remote_run.get("publication_status")
+        if not isinstance(publication, dict):
+            return
+        branch = self.store.run_branch(run_id)
+        if branch is None:
+            raise RuntimeError("Publication has no locally owned run branch")
+        binding = self._publication_binding(remote_run)
+        local_binding = (
+            branch.branch_name,
+            branch.upstream_ref,
+            branch.base_commit,
+            branch.feature_head,
+        )
+        remote_binding = (
+            binding["branch_name"],
+            binding["upstream_ref"],
+            binding["base_commit"],
+            binding["snapshot_commit"],
+        )
+        if local_binding != remote_binding:
+            raise RuntimeError(
+                "Publication binding differs from local branch ownership"
+            )
+        state = str(publication["state"])
+        if state == "blocked":
+            return
+        if state == "requested":
+            remote_run = await self.api.start_publication(run_id, binding)
+            publication = remote_run.get("publication_status") or {}
+            state = str(publication.get("state"))
+        if state not in {
+            "pushing",
+            "creating_pr",
+            "cancel_requested",
+            "published",
+            "merged",
+            "cleanup_pending",
+            "cleanup_blocked",
+        }:
+            return
+        if state in {"cleanup_pending", "cleanup_blocked"}:
+            await self._cleanup_publication(remote_run=remote_run, binding=binding)
+            return
+        mapping = next(
+            (
+                item
+                for item in self.settings.project_mappings
+                if item.project_id == branch.project_id
+            ),
+            None,
+        )
+        if mapping is None or mapping.remote_url is None:
+            raise RuntimeError("Publication repository mapping is unavailable")
+        result = publish_github_pull_request(
+            repository=branch.repository_path,
+            remote_name=branch.remote_name,
+            remote_url=mapping.remote_url,
+            upstream_ref=branch.upstream_ref,
+            branch_name=branch.branch_name,
+            accepted_head=branch.feature_head,
+            title=str(remote_run.get("task_title") or "Tether Brain task"),
+            run_id=str(run_id),
+            create_pull_request=state
+            not in {"cancel_requested", "published", "merged"},
+        )
+        payload = {
+            **binding,
+            "published_head": result.published_head,
+            "provider": result.provider,
+            "pull_request_url": result.pull_request_url,
+            "pull_request_number": result.pull_request_number,
+            "remote_branch_present": result.remote_branch_present,
+            "ahead_count": result.ahead_count,
+            "behind_count": result.behind_count,
+            "provider_merged_at": result.provider_merged_at,
+            "handoff_retention_days": (self.settings.worktrees.handoff_retention_days),
+        }
+        if result.state == "cancelled":
+            await self.api.complete_publication(
+                run_id, {**payload, "status": "cancelled"}
+            )
+            return
+        if state == "pushing":
+            await self.api.complete_publication(
+                run_id, {**payload, "status": "creating_pr"}
+            )
+        if state not in {"published", "merged"} or (
+            state == "published" and result.state == "published"
+        ):
+            remote_run = await self.api.complete_publication(
+                run_id, {**payload, "status": "published"}
+            )
+            self.store.mark_run_branch_published(run_id, result.published_head)
+        if result.state == "merged" and state != "merged":
+            remote_run = await self.api.complete_publication(
+                run_id, {**payload, "status": "merged"}
+            )
+            self.store.mark_run_branch_merged(run_id, result.published_head)
+        elif state == "merged":
+            self.store.mark_run_branch_merged(run_id, result.published_head)
+        if result.state == "merged":
+            await self._cleanup_publication(remote_run=remote_run, binding=binding)
+
+    async def _cleanup_publication(
+        self,
+        *,
+        remote_run: dict[str, Any],
+        binding: dict[str, Any],
+    ) -> None:
+        publication = remote_run.get("publication_status") or {}
+        eligible_raw = publication.get("cleanup_eligible_at")
+        if not eligible_raw:
+            return
+        eligible_at = datetime.fromisoformat(str(eligible_raw))
+        if eligible_at > datetime.now(UTC):
+            return
+        run_id = UUID(str(remote_run["id"]))
+        payload = {
+            **binding,
+            "published_head": binding["snapshot_commit"],
+            "provider": publication.get("provider"),
+            "pull_request_url": publication.get("pull_request_url"),
+            "pull_request_number": publication.get("pull_request_number"),
+            "remote_branch_present": publication.get("remote_branch_present"),
+            "ahead_count": publication.get("ahead_count"),
+            "behind_count": publication.get("behind_count"),
+            "provider_merged_at": publication.get("provider_merged_at"),
+            "handoff_retention_days": self.settings.worktrees.handoff_retention_days,
+        }
+        if publication.get("state") != "cleanup_pending":
+            remote_run = await self.api.complete_publication(
+                run_id,
+                {**payload, "status": "cleanup_pending"},
+            )
+            publication = remote_run.get("publication_status") or publication
+        try:
+            cleanup_merged_publication(
+                store=self.store,
+                run_id=str(run_id),
+                accepted_head=str(binding["snapshot_commit"]),
+                accepted_tree=str(binding["snapshot_tree"]),
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            await self.api.complete_publication(
+                run_id,
+                {
+                    **payload,
+                    "status": "cleanup_blocked",
+                    "error_code": "cleanup_failed",
+                    "error_message": str(self._remote_safe(str(error)))[:512],
+                },
+            )
+            return
+        await self.api.complete_publication(
+            run_id,
+            {**payload, "status": "cleaned"},
+        )
 
     async def _reconcile_change_set_integrity(self) -> None:
         for record in self.store.change_sets():
@@ -1105,6 +1347,8 @@ class AgentDaemon:
         *,
         context: dict[str, Any],
         run_id: UUID,
+        agent_name: str = "agent",
+        task_title: str = "task",
     ) -> tuple[Path, dict[str, Any]]:
         local_context = copy.deepcopy(context)
         project_items = [
@@ -1132,10 +1376,22 @@ class AgentDaemon:
                         f"mapping: {project['name']}."
                     )
                 continue
+            requested_ref = project.get("ref")
+            if project.get("is_primary") and mapping.access == "write":
+                prepared_branch = prepare_run_branch(
+                    store=self.store,
+                    mapping=mapping,
+                    run_id=run_id,
+                    requested_ref=requested_ref,
+                    agent_name=agent_name,
+                    task_title=task_title,
+                )
+                requested_ref = prepared_branch.base_commit
+                project["local_branch"] = prepared_branch.branch_name
             directory = self.worktrees.working_directory(
                 mapping,
                 run_id,
-                project.get("ref"),
+                requested_ref,
             )
             project["local_checkout"] = str(directory)
             if directory != mapping.local_path:

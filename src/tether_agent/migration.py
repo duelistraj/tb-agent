@@ -29,6 +29,7 @@ def _migration_config(settings: DaemonSettings, revision: int) -> ProfileConfig:
         repository = inspect_repository(
             mapping.local_path,
             remote=mapping.remote_url,
+            remote_name=mapping.remote_name,
             allow_no_remote=True,
         )
         mappings.append(
@@ -36,6 +37,7 @@ def _migration_config(settings: DaemonSettings, revision: int) -> ProfileConfig:
                 update={
                     "local_path": repository.root,
                     "remote_url": repository.remote_url,
+                    "remote_name": repository.remote_name,
                 }
             )
         )

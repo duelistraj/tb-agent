@@ -66,6 +66,22 @@ class ChangeSetRecord:
     accepted_snapshot_tree: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class RunBranchRecord:
+    run_id: UUID
+    project_id: UUID
+    repository_path: Path
+    branch_name: str
+    remote_name: str
+    upstream_ref: str
+    base_commit: str
+    state: str
+    feature_head: str
+    published_head: str | None
+    merge_confirmed_at: datetime | None
+    cleaned_at: datetime | None
+
+
 class StateStore:
     def __init__(self, path: Path, *, initialize: bool = True) -> None:
         self.path = path.expanduser()
@@ -253,6 +269,22 @@ class StateStore:
                     retain_until TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(run_id, project_id)
+                );
+                CREATE TABLE IF NOT EXISTS run_branches (
+                    run_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    repository_path TEXT NOT NULL,
+                    branch_name TEXT NOT NULL UNIQUE,
+                    remote_name TEXT NOT NULL,
+                    upstream_ref TEXT NOT NULL,
+                    base_commit TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    feature_head TEXT NOT NULL,
+                    published_head TEXT,
+                    merge_confirmed_at TEXT,
+                    cleaned_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS credentials (
                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -1180,6 +1212,190 @@ class StateStore:
             return connection.execute(
                 "SELECT * FROM handoffs WHERE run_id = ?", (str(run_id),)
             ).fetchone()
+
+    @staticmethod
+    def _run_branch(row: sqlite3.Row) -> RunBranchRecord:
+        return RunBranchRecord(
+            run_id=UUID(str(row["run_id"])),
+            project_id=UUID(str(row["project_id"])),
+            repository_path=Path(str(row["repository_path"])),
+            branch_name=str(row["branch_name"]),
+            remote_name=str(row["remote_name"]),
+            upstream_ref=str(row["upstream_ref"]),
+            base_commit=str(row["base_commit"]),
+            state=str(row["state"]),
+            feature_head=str(row["feature_head"]),
+            published_head=row["published_head"],
+            merge_confirmed_at=(
+                datetime.fromisoformat(str(row["merge_confirmed_at"]))
+                if row["merge_confirmed_at"] is not None
+                else None
+            ),
+            cleaned_at=(
+                datetime.fromisoformat(str(row["cleaned_at"]))
+                if row["cleaned_at"] is not None
+                else None
+            ),
+        )
+
+    def run_branch(self, run_id: UUID) -> RunBranchRecord | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM run_branches WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+        return self._run_branch(row) if row is not None else None
+
+    def reserve_run_branch(
+        self,
+        *,
+        run_id: UUID,
+        project_id: UUID,
+        repository_path: Path,
+        branch_name: str,
+        remote_name: str,
+        upstream_ref: str,
+        base_commit: str,
+    ) -> RunBranchRecord:
+        now = datetime.now(UTC).isoformat()
+        with self.connection(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO run_branches(
+                    run_id, project_id, repository_path, branch_name,
+                    remote_name, upstream_ref, base_commit, state,
+                    feature_head, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'base', ?, ?, ?)
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (
+                    str(run_id),
+                    str(project_id),
+                    str(repository_path),
+                    branch_name,
+                    remote_name,
+                    upstream_ref,
+                    base_commit,
+                    base_commit,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM run_branches WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+        assert row is not None
+        record = self._run_branch(row)
+        identity = (
+            record.project_id,
+            record.repository_path,
+            record.branch_name,
+            record.remote_name,
+            record.upstream_ref,
+            record.base_commit,
+        )
+        if identity != (
+            project_id,
+            repository_path,
+            branch_name,
+            remote_name,
+            upstream_ref,
+            base_commit,
+        ):
+            raise RuntimeError("Run branch ownership does not match local state")
+        return record
+
+    def promote_run_branch(self, run_id: UUID, snapshot_commit: str) -> None:
+        with self.connection(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT state, feature_head FROM run_branches WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"Run branch {run_id} does not exist")
+            if row["state"] == "accepted" and row["feature_head"] == snapshot_commit:
+                return
+            if row["state"] != "base":
+                raise RuntimeError("Run branch is not awaiting acceptance")
+            connection.execute(
+                """
+                UPDATE run_branches
+                SET state = 'accepted', feature_head = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (snapshot_commit, datetime.now(UTC).isoformat(), str(run_id)),
+            )
+
+    def mark_run_branch_published(self, run_id: UUID, published_head: str) -> None:
+        with self.connection(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT state, feature_head, published_head FROM run_branches "
+                "WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"Run branch {run_id} does not exist")
+            if row["feature_head"] != published_head:
+                raise RuntimeError(
+                    "Published head differs from the accepted run branch"
+                )
+            if row["state"] in {"published", "merged", "cleaned"}:
+                if row["published_head"] != published_head:
+                    raise RuntimeError("Published run branch identity changed")
+                return
+            if row["state"] != "accepted":
+                raise RuntimeError("Run branch is not ready for publication")
+            connection.execute(
+                """
+                UPDATE run_branches
+                SET state = 'published', published_head = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (published_head, datetime.now(UTC).isoformat(), str(run_id)),
+            )
+
+    def mark_run_branch_merged(self, run_id: UUID, published_head: str) -> None:
+        now = datetime.now(UTC)
+        self.mark_run_branch_published(run_id, published_head)
+        with self.connection(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT state, published_head FROM run_branches WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            assert row is not None
+            if row["state"] in {"merged", "cleaned"}:
+                return
+            if row["state"] != "published" or row["published_head"] != published_head:
+                raise RuntimeError("Run branch publication identity changed")
+            connection.execute(
+                """
+                UPDATE run_branches
+                SET state = 'merged', merge_confirmed_at = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (now.isoformat(), now.isoformat(), str(run_id)),
+            )
+
+    def mark_run_branch_cleaned(self, run_id: UUID, published_head: str) -> None:
+        now = datetime.now(UTC)
+        with self.connection(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT state, published_head FROM run_branches WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"Run branch {run_id} does not exist")
+            if row["state"] == "cleaned" and row["published_head"] == published_head:
+                return
+            if row["state"] != "merged" or row["published_head"] != published_head:
+                raise RuntimeError("Only the exact merged run branch can be cleaned")
+            connection.execute(
+                """
+                UPDATE run_branches
+                SET state = 'cleaned', cleaned_at = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (now.isoformat(), now.isoformat(), str(run_id)),
+            )
 
     def begin_handoff(
         self,

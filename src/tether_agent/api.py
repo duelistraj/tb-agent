@@ -403,3 +403,38 @@ class TetherApi:
         if response.is_error:
             raise AgentApiError(response)
         return response.json()
+
+    async def pending_publications(self, installation_id: UUID) -> list[dict[str, Any]]:
+        response = await self._request(
+            "GET",
+            f"/api/agent/v1/installations/{installation_id}/publications",
+        )
+        if response.status_code in {404, 405}:
+            return []
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
+    async def start_publication(
+        self, run_id: UUID, binding: dict[str, Any]
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/publication/start",
+            json=binding,
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
+    async def complete_publication(
+        self, run_id: UUID, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/publication/complete",
+            json=payload,
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()

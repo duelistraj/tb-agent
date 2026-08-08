@@ -1,13 +1,18 @@
 import json
 import logging
+import os
+import stat
 import subprocess
 from pathlib import Path, PurePosixPath
+from typing import cast
 from uuid import uuid4
 
 import pytest
 
 from tether_agent.cli import (
+    _configure_logging,
     _finish_guided_setup,
+    _PrivateRotatingFileHandler,
     _reconcile_oauth_credential,
     _RedactPatFilter,
     build_parser,
@@ -33,6 +38,74 @@ from tether_agent.state import StateStore
 def set_profile_homes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TETHER_AGENT_CONFIG_HOME", str(tmp_path / "config-home"))
     monkeypatch.setenv("TETHER_AGENT_STATE_HOME", str(tmp_path / "state-home"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX mode bits")
+def test_configure_logging_repairs_legacy_log_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = ProfilePaths("default", tmp_path / "config", tmp_path / "state")
+    paths.state_dir.mkdir(mode=0o700)
+    paths.log_file.write_text("legacy log\n", encoding="utf-8")
+    backup_file = Path(f"{paths.log_file}.1")
+    backup_file.write_text("legacy backup\n", encoding="utf-8")
+    os.chmod(paths.log_file, 0o644)
+    os.chmod(backup_file, 0o644)
+    configured_handlers: list[logging.Handler] = []
+
+    def capture_handlers(**kwargs: object) -> None:
+        configured_handlers.extend(cast(list[logging.Handler], kwargs["handlers"]))
+
+    monkeypatch.setattr(logging, "basicConfig", capture_handlers)
+    try:
+        _configure_logging(paths)
+    finally:
+        for handler in configured_handlers:
+            handler.close()
+
+    assert stat.S_IMODE(paths.log_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(backup_file.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX mode bits")
+def test_private_rotating_log_handler_secures_each_new_log(tmp_path: Path) -> None:
+    log_file = tmp_path / "daemon.log"
+    handler = _PrivateRotatingFileHandler(
+        log_file,
+        maxBytes=1,
+        backupCount=1,
+        encoding="utf-8",
+    )
+    try:
+        handler.emit(
+            logging.LogRecord(
+                name="tether_agent.test",
+                level=logging.INFO,
+                pathname=__file__,
+                lineno=1,
+                msg="first entry",
+                args=(),
+                exc_info=None,
+            )
+        )
+        handler.doRollover()
+        handler.emit(
+            logging.LogRecord(
+                name="tether_agent.test",
+                level=logging.INFO,
+                pathname=__file__,
+                lineno=1,
+                msg="second entry",
+                args=(),
+                exc_info=None,
+            )
+        )
+    finally:
+        handler.close()
+
+    assert stat.S_IMODE(log_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(Path(f"{log_file}.1").stat().st_mode) == 0o600
 
 
 def test_parser_exposes_every_phase_one_command() -> None:

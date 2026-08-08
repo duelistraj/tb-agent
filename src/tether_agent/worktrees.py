@@ -33,7 +33,7 @@ class WorktreeManager:
         root.mkdir(parents=True, exist_ok=True)
         command = ["git", "-C", str(mapping.local_path), "worktree", "add"]
         if requested_ref:
-            command.extend([str(path), requested_ref])
+            command.extend(["--detach", str(path), requested_ref])
         else:
             command.extend(["--detach", str(path), "HEAD"])
         subprocess.run(command, check=True)

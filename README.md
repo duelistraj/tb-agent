@@ -252,17 +252,18 @@ They never contain a PAT or repository path.
 Existing systemd and LaunchAgent service identities are preserved during the executable rename.
 After upgrading from a release before 0.6.0, run `tb-agent service install` once to rewrite an older service definition that invokes the removed executable.
 
-## Review and apply local changes
+## Review, accept, and publish local changes
 
 Every writable run uses its own Git worktree.
 After execution, tb-agent creates one synthetic immutable commit under `refs/tb-agent/runs/<run-id>` whose parent is the captured run base.
-The snapshot tree hash is the reviewed content identity, even when later application creates a different cherry-pick commit SHA.
+The snapshot tree hash is the reviewed content identity bound through acceptance, feature-branch handoff, and publication.
 
 Inspect and validate retained results locally:
 
 ```bash
 tb-agent changes list
 tb-agent changes status <run-id>
+tb-agent changes path <run-id>
 tb-agent changes diff <run-id>
 tb-agent changes test <run-id> -- npm test
 ```
@@ -272,19 +273,33 @@ It never tests later manual worktree edits, reports the validation revision to T
 Any worktree modification after snapshot creation supersedes the current review revision.
 
 Browser acceptance binds the run ID, snapshot commit, snapshot tree, validation revision, and change-set revision.
-Only that accepted binding may be applied.
-The daemon fast-forwards when the target checkout still equals the run base.
-Otherwise it cherry-picks only when the base remains an ancestor of the current branch.
-The target checkout must have no staged, unstaged, untracked, conflicted, or dirty submodule state.
+Only that accepted binding may advance the run-owned feature branch.
+The execution worktree remains detached and the user's current checkout is never switched, committed, fast-forwarded, or cherry-picked by handoff.
+Run branches use `feat/<agent>/<task>-<run-id>` and are based on the fetched upstream default branch captured when the run starts.
+Ambiguous remotes or default branches block before execution and require explicit configuration.
 
-If an explicitly accepted handoff is blocked, clean or reconcile the target checkout and retry it:
+If an explicitly accepted handoff is blocked, reconcile the owned run branch and retry it:
 
 ```bash
 tb-agent changes apply <run-id>
 ```
 
 This command cannot accept a result and refuses any revision that has not already been accepted in Tether Brain.
-Repository handoff locks are derived from the canonical Git common directory, so separate profiles and processes cannot apply to the same repository concurrently.
+Repository handoff locks are derived from the canonical Git common directory, so separate profiles and processes cannot mutate run refs in the same repository concurrently.
+
+Pull request publication is a separate, explicitly approved browser action.
+It never force-pushes, verifies an existing remote branch and pull request against the exact accepted snapshot, and blocks on divergence.
+To reconcile an already approved publication immediately from the terminal, run:
+
+```bash
+tb-agent changes publication <run-id>
+```
+
+The task reaches Done only after Tether Brain records the exact published head and pull request URL.
+Merge confirmation affects cleanup eligibility only.
+Local run worktrees, feature refs, and snapshot refs are retained until the pull request is confirmed merged and `worktrees.handoff_retention_days` expires.
+Remote branch deletion remains a GitHub repository policy, and GitHub's Automatically delete head branches setting is recommended.
+Local feature-ref cleanup uses the accepted published head as a compare-and-swap guard and blocks if anyone modified the branch.
 
 Dirty worktrees created by an older release are marked `legacy_manual_review_required`.
 They can be inspected or rerun, but tb-agent never turns their existing filesystem contents into an automatically accepted snapshot.

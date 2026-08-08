@@ -17,6 +17,7 @@ def test_inspection_canonicalizes_root_and_remote(git_repository: Path) -> None:
     repository = inspect_repository(nested)
 
     assert repository.root == git_repository.resolve()
+    assert repository.remote_name == "origin"
     assert repository.remote_url == "ssh://git@github.com/TetherBrain/example"
 
 
@@ -85,6 +86,7 @@ def test_missing_and_ambiguous_remotes_require_explicit_choice(
         remote="https://example.test/one.git",
     )
     assert selected.remote_url == "https://example.test/one"
+    assert selected.remote_name == "one"
 
 
 def test_non_repository_is_rejected(tmp_path: Path) -> None:

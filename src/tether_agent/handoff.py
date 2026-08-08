@@ -1,10 +1,9 @@
-"""Transactional application of explicitly accepted Git snapshots."""
+"""Transactional promotion of accepted snapshots to run-owned feature refs."""
 
 from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 
 from tether_agent.locking import LockUnavailable, ProfileLock
@@ -18,67 +17,14 @@ class HandoffResult:
     applied_commit: str
 
 
-def _git(checkout: Path, *arguments: str, check: bool = True) -> str:
+def _git(repository: Path, *arguments: str, check: bool = True) -> str:
     result = subprocess.run(
-        ["git", "-C", str(checkout), *arguments],
+        ["git", "-C", str(repository), *arguments],
         check=check,
         capture_output=True,
         text=True,
     )
     return result.stdout.strip()
-
-
-def _index_digest(checkout: Path) -> str:
-    raw = _git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "index")
-    index_path = Path(raw)
-    return sha256(index_path.read_bytes()).hexdigest() if index_path.exists() else ""
-
-
-def _status(checkout: Path) -> str:
-    return _git(
-        checkout,
-        "status",
-        "--porcelain=v2",
-        "--untracked-files=all",
-        "--ignore-submodules=none",
-    )
-
-
-def assert_clean_checkout(checkout: Path) -> None:
-    if _status(checkout):
-        raise RuntimeError(
-            "The target checkout is not clean. Commit, stash, or remove staged, "
-            "unstaged, untracked, conflicted, and dirty submodule changes first."
-        )
-
-
-def _branch(checkout: Path) -> str | None:
-    result = subprocess.run(
-        ["git", "-C", str(checkout), "symbolic-ref", "--quiet", "--short", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip() if result.returncode == 0 else None
-
-
-def _is_ancestor(checkout: Path, ancestor: str, descendant: str) -> bool:
-    return (
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(checkout),
-                "merge-base",
-                "--is-ancestor",
-                ancestor,
-                descendant,
-            ],
-            check=False,
-            capture_output=True,
-        ).returncode
-        == 0
-    )
 
 
 def apply_accepted_snapshot(
@@ -105,18 +51,25 @@ def apply_accepted_snapshot(
     common_directory = canonical_common_directory(checkout)
     if common_directory != canonical_common_directory(change_set.repository_path):
         raise RuntimeError("The target checkout belongs to a different repository")
+    branch = store.run_branch(change_set.run_id)
+    if branch is None:
+        raise RuntimeError(
+            "This accepted run predates per-run branch handoff. Upgrade tb-agent "
+            "and rerun the task; the mapped checkout will not be modified."
+        )
+    if canonical_common_directory(branch.repository_path) != common_directory:
+        raise RuntimeError("The run-owned branch belongs to a different repository")
     lock = ProfileLock(
-        common_directory / "tb-agent" / "handoff.lock",
+        common_directory / "tb-agent" / "repository.lock",
         label="repository handoff",
     )
     try:
         lock.acquire()
     except LockUnavailable as error:
         raise RuntimeError(
-            "Another tb-agent process is applying changes to this repository"
+            "Another tb-agent process is updating this repository"
         ) from error
     try:
-        assert_clean_checkout(checkout)
         previous = store.handoff(change_set.run_id)
         if previous is not None and previous["state"] == "applied":
             return HandoffResult(
@@ -127,92 +80,54 @@ def apply_accepted_snapshot(
             raise RuntimeError(
                 "The previous handoff attempt is blocked and requires an explicit retry"
             )
-        if previous is not None and previous["state"] == "applying":
-            current_head = _git(checkout, "rev-parse", "HEAD")
-            captured_head = str(previous["captured_head"])
-            recovered = current_head == change_set.snapshot_commit
-            if not recovered and current_head != captured_head:
-                parent = _git(checkout, "rev-parse", f"{current_head}^")
-                message = _git(checkout, "show", "-s", "--format=%B", current_head)
-                recovered = (
-                    parent == captured_head
-                    and f"Tether-Brain-Run-ID: {change_set.run_id}" in message
+        branch_ref = f"refs/heads/{branch.branch_name}"
+        current_head = _git(checkout, "rev-parse", "--verify", branch_ref, check=False)
+        if current_head not in {branch.base_commit, change_set.snapshot_commit}:
+            raise RuntimeError(
+                f"Run branch {branch.branch_name} was modified and will not be overwritten"
+            )
+        if previous is None or previous["state"] != "applying":
+            store.begin_handoff(
+                run_id=change_set.run_id,
+                snapshot_commit=change_set.snapshot_commit,
+                snapshot_tree=change_set.snapshot_tree,
+                validation_revision=change_set.validation_revision,
+                change_set_revision=change_set.change_set_revision,
+                checkout_path=checkout,
+                common_directory=common_directory,
+                captured_head=branch.base_commit,
+                captured_branch=branch.branch_name,
+                captured_status="",
+                captured_index_digest="",
+                method="feature_branch",
+            )
+        if current_head == branch.base_commit:
+            try:
+                _git(
+                    checkout,
+                    "update-ref",
+                    branch_ref,
+                    change_set.snapshot_commit,
+                    branch.base_commit,
                 )
-            if recovered:
+            except BaseException as error:
                 store.finish_handoff(
                     change_set.run_id,
-                    state="applied",
-                    applied_commit=current_head,
+                    state="blocked",
+                    error=str(error),
                 )
-                return HandoffResult(
-                    method=str(previous["method"]),
-                    applied_commit=current_head,
-                )
-            if current_head != captured_head:
                 raise RuntimeError(
-                    "The target checkout changed during handoff recovery"
-                )
-        captured_head = _git(checkout, "rev-parse", "HEAD")
-        captured_branch = _branch(checkout)
-        captured_status = _status(checkout)
-        captured_index_digest = _index_digest(checkout)
-        if captured_head == change_set.base_commit:
-            method = "fast_forward"
-        elif _is_ancestor(checkout, change_set.base_commit, captured_head):
-            method = "cherry_pick"
-        else:
-            raise RuntimeError(
-                "The run base is not an ancestor of the target branch. Rebase or "
-                "merge the target branch before retrying the handoff."
-            )
-        store.begin_handoff(
-            run_id=change_set.run_id,
-            snapshot_commit=change_set.snapshot_commit,
-            snapshot_tree=change_set.snapshot_tree,
-            validation_revision=change_set.validation_revision,
-            change_set_revision=change_set.change_set_revision,
-            checkout_path=checkout,
-            common_directory=common_directory,
-            captured_head=captured_head,
-            captured_branch=captured_branch,
-            captured_status=captured_status,
-            captured_index_digest=captured_index_digest,
-            method=method,
-        )
-        try:
-            if method == "fast_forward":
-                _git(checkout, "merge", "--ff-only", change_set.snapshot_commit)
-            else:
-                _git(checkout, "cherry-pick", change_set.snapshot_commit)
-            applied_commit = _git(checkout, "rev-parse", "HEAD")
-            assert_clean_checkout(checkout)
-        except BaseException as error:
-            _git(checkout, "cherry-pick", "--abort", check=False)
-            _git(checkout, "merge", "--abort", check=False)
-            restored = (
-                _git(checkout, "rev-parse", "HEAD") == captured_head
-                and _branch(checkout) == captured_branch
-                and _status(checkout) == captured_status
-                and _index_digest(checkout) == captured_index_digest
-            )
-            message = str(error)
-            if not restored:
-                message = (
-                    "Git handoff failed and the captured checkout state could not "
-                    "be verified after rollback. Inspect the checkout manually. "
-                    + message
-                )
-            store.finish_handoff(
-                change_set.run_id,
-                state="blocked",
-                error=message,
-            )
-            raise RuntimeError(message) from error
+                    f"Run branch {branch.branch_name} changed during acceptance"
+                ) from error
+        store.promote_run_branch(change_set.run_id, change_set.snapshot_commit)
         store.finish_handoff(
             change_set.run_id,
             state="applied",
-            applied_commit=applied_commit,
+            applied_commit=change_set.snapshot_commit,
         )
-        return HandoffResult(method=method, applied_commit=applied_commit)
+        return HandoffResult(
+            method="feature_branch",
+            applied_commit=change_set.snapshot_commit,
+        )
     finally:
         lock.release()

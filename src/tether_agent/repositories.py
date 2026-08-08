@@ -14,6 +14,7 @@ SCP_REMOTE_PATTERN = re.compile(r"^(?P<user>[^@/:]+)@(?P<host>[^/:]+):(?P<path>.
 @dataclass(frozen=True, slots=True)
 class RepositoryInfo:
     root: Path
+    remote_name: str | None
     remote_url: str | None
 
 
@@ -77,7 +78,7 @@ def git_remote_identity(value: str) -> str:
     return f"{authority}{parsed.path}".casefold()
 
 
-def _discovered_remote(root: Path) -> str | None:
+def _remotes(root: Path) -> dict[str, list[str]]:
     names = [item for item in _git(root, "remote").splitlines() if item]
     urls_by_name: dict[str, list[str]] = {}
     for name in names:
@@ -87,30 +88,78 @@ def _discovered_remote(root: Path) -> str | None:
             if item
         ]
         urls_by_name[name] = list(dict.fromkeys(values))
-    if "origin" in urls_by_name:
-        origin = urls_by_name["origin"]
-        if len(origin) == 1:
-            return normalize_git_remote(origin[0])
-        if len(origin) > 1:
-            raise ValueError(
-                "The origin remote has multiple URLs. Pass the intended URL with --remote."
-            )
-    all_urls = list(
-        dict.fromkeys(value for values in urls_by_name.values() for value in values)
-    )
-    if len(all_urls) == 1:
-        return normalize_git_remote(all_urls[0])
-    if len(all_urls) > 1:
-        raise ValueError(
-            "The repository has multiple remotes. Pass the intended URL with --remote."
+    return urls_by_name
+
+
+def resolve_remote(
+    root: Path,
+    *,
+    remote: str | None = None,
+    remote_name: str | None = None,
+) -> tuple[str | None, str | None]:
+    urls_by_name = _remotes(root)
+    if not urls_by_name:
+        if remote is not None or remote_name is not None:
+            raise ValueError("The selected Git remote is not configured locally")
+        return None, None
+    if remote_name is not None:
+        values = urls_by_name.get(remote_name)
+        if values is None:
+            raise ValueError(f"Git remote '{remote_name}' does not exist")
+        normalized_values = list(
+            dict.fromkeys(normalize_git_remote(item) for item in values)
         )
-    return None
+        if remote is not None:
+            selected_url = normalize_git_remote(remote)
+            matches = [
+                value
+                for value in normalized_values
+                if git_remote_identity(value) == git_remote_identity(selected_url)
+            ]
+            if len(matches) != 1:
+                raise ValueError(f"Git remote '{remote_name}' does not match --remote")
+            return remote_name, matches[0]
+        if len(normalized_values) != 1:
+            raise ValueError(
+                f"Git remote '{remote_name}' has multiple URLs. Pass --remote as well."
+            )
+        return remote_name, normalized_values[0]
+    if remote is not None:
+        selected_url = normalize_git_remote(remote)
+        matching_names = [
+            name
+            for name, values in urls_by_name.items()
+            if any(
+                git_remote_identity(value) == git_remote_identity(selected_url)
+                for value in values
+            )
+        ]
+        if len(matching_names) != 1:
+            raise ValueError(
+                "The selected Git URL does not identify exactly one local remote. "
+                "Pass --remote-name."
+            )
+        return matching_names[0], selected_url
+    if len(urls_by_name) != 1:
+        raise ValueError(
+            "The repository has multiple remotes. Pass --remote-name and --remote."
+        )
+    selected_name, values = next(iter(urls_by_name.items()))
+    normalized_values = list(
+        dict.fromkeys(normalize_git_remote(item) for item in values)
+    )
+    if len(normalized_values) != 1:
+        raise ValueError(
+            f"Git remote '{selected_name}' has multiple URLs. Pass --remote explicitly."
+        )
+    return selected_name, normalized_values[0]
 
 
 def inspect_repository(
     path: Path,
     *,
     remote: str | None = None,
+    remote_name: str | None = None,
     allow_no_remote: bool = False,
 ) -> RepositoryInfo:
     candidate = path.expanduser().resolve(strict=True)
@@ -129,12 +178,18 @@ def inspect_repository(
         candidate.relative_to(root)
     except ValueError as error:
         raise ValueError("Repository path escapes its canonical Git root") from error
-    selected_remote = (
-        normalize_git_remote(remote) if remote else _discovered_remote(root)
+    selected_remote_name, selected_remote = resolve_remote(
+        root,
+        remote=remote,
+        remote_name=remote_name,
     )
     if selected_remote is None and not allow_no_remote:
         raise ValueError(
             "The repository has no unambiguous remote. Pass --remote URL or "
             "--allow-no-remote explicitly."
         )
-    return RepositoryInfo(root=root, remote_url=selected_remote)
+    return RepositoryInfo(
+        root=root,
+        remote_name=selected_remote_name,
+        remote_url=selected_remote,
+    )

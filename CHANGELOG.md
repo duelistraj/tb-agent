@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.10.0 - 2026-08-08
+
+### Added
+
+- Give every writable run one deterministic, persisted `feat/<agent>/<task>-<run-id>` branch based on an explicitly resolved remote default branch.
+- Add crash-safe, non-force GitHub pull request publication with exact accepted-revision reconciliation, cancellation races, merge detection, and configurable retained cleanup.
+- Add `tb-agent changes path <run-id>` for opening the isolated execution worktree and `tb-agent changes publication <run-id>` for reconciling a browser-approved publication.
+
+### Changed
+
+- Keep execution worktrees detached and preserve the user's current checkout during acceptance and handoff.
+- Require explicit remote selection when remotes or default branches are ambiguous instead of guessing.
+- Delete local feature and snapshot refs only after confirmed merge and `handoff_retention_days`, using expected-head checks so modified refs are never removed.
+- Tolerate GitHub automatically deleting a merged pull request branch while retaining publication audit state.
+
 ## 0.9.3 - 2026-08-08
 
 ### Fixed

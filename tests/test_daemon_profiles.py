@@ -280,6 +280,16 @@ async def test_applied_handoff_recovers_after_completion_response_is_lost(
         validation_revision=0,
         change_set_revision=1,
     )
+    store.reserve_run_branch(
+        run_id=run_id,
+        project_id=uuid4(),
+        repository_path=repository,
+        branch_name=f"feat/codex/recovery-{run_id}",
+        remote_name="origin",
+        upstream_ref="refs/remotes/origin/main",
+        base_commit="0" * 40,
+    )
+    store.promote_run_branch(run_id, snapshot_commit)
     store.begin_handoff(
         run_id=run_id,
         snapshot_commit=snapshot_commit,

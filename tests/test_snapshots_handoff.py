@@ -8,6 +8,7 @@ import pytest
 
 from tether_agent.changes import refresh_snapshot_state, validate_snapshot
 from tether_agent.handoff import apply_accepted_snapshot
+from tether_agent.publication import cleanup_merged_publication
 from tether_agent.snapshots import create_snapshot, head_commit, snapshot_is_current
 from tether_agent.state import StateStore
 
@@ -41,6 +42,17 @@ def snapshotted_change_set(tmp_path: Path):
     (worktree / "tracked.txt").write_text("agent\n")
     (worktree / "new.txt").write_text("new\n")
     store = StateStore(tmp_path / "state" / "state.sqlite3")
+    branch_name = f"feat/test-agent/task-{run_id}"
+    store.reserve_run_branch(
+        run_id=run_id,
+        project_id=uuid4(),
+        repository_path=repository,
+        branch_name=branch_name,
+        remote_name="origin",
+        upstream_ref="refs/remotes/origin/main",
+        base_commit=base,
+    )
+    git(repository, "update-ref", f"refs/heads/{branch_name}", base, "0" * 40)
     store.begin_change_set(
         run_id=run_id,
         repository_path=repository,
@@ -172,8 +184,13 @@ def test_validation_runs_in_immutable_snapshot_checkout(tmp_path: Path) -> None:
     assert log_path.exists()
 
 
-def test_fast_forward_handoff_applies_only_accepted_snapshot(tmp_path: Path) -> None:
+def test_handoff_promotes_only_run_branch_and_keeps_checkout_immutable(
+    tmp_path: Path,
+) -> None:
     repository, _, store, record, snapshot = snapshotted_change_set(tmp_path)
+    original_branch = git(repository, "branch", "--show-current")
+    original_head = head_commit(repository)
+    (repository / "manual.txt").write_text("manual\n")
     record = store.accept_change_set(
         run_id=record.run_id,
         snapshot_commit=snapshot.commit,
@@ -188,13 +205,20 @@ def test_fast_forward_handoff_applies_only_accepted_snapshot(tmp_path: Path) -> 
         checkout=repository,
     )
 
-    assert result.method == "fast_forward"
-    assert git(repository, "rev-parse", "HEAD") == snapshot.commit
-    assert (repository / "tracked.txt").read_text() == "agent\n"
-    assert (repository / "new.txt").read_text() == "new\n"
+    branch = store.run_branch(record.run_id)
+    assert branch is not None
+    assert result.method == "feature_branch"
+    assert result.applied_commit == snapshot.commit
+    assert (
+        git(repository, "rev-parse", f"refs/heads/{branch.branch_name}")
+        == snapshot.commit
+    )
+    assert git(repository, "branch", "--show-current") == original_branch
+    assert head_commit(repository) == original_head
+    assert (repository / "manual.txt").read_text() == "manual\n"
 
 
-def test_cherry_pick_handoff_preserves_descendant_commit(tmp_path: Path) -> None:
+def test_handoff_does_not_cherry_pick_onto_descendant_checkout(tmp_path: Path) -> None:
     repository, _, store, record, snapshot = snapshotted_change_set(tmp_path)
     (repository / "independent.txt").write_text("current branch\n")
     git(repository, "add", "independent.txt")
@@ -214,19 +238,28 @@ def test_cherry_pick_handoff_preserves_descendant_commit(tmp_path: Path) -> None
         checkout=repository,
     )
 
-    assert result.method == "cherry_pick"
-    assert result.applied_commit != snapshot.commit
-    assert git(repository, "rev-parse", f"{result.applied_commit}^") == descendant
+    branch = store.run_branch(record.run_id)
+    assert branch is not None
+    assert result.method == "feature_branch"
+    assert result.applied_commit == snapshot.commit
+    assert (
+        git(repository, "rev-parse", f"refs/heads/{branch.branch_name}")
+        == snapshot.commit
+    )
+    assert head_commit(repository) == descendant
     assert (repository / "independent.txt").read_text() == "current branch\n"
-    assert (repository / "tracked.txt").read_text() == "agent\n"
+    assert (repository / "tracked.txt").read_text() == "base\n"
 
 
-def test_cherry_pick_conflict_aborts_and_restores_checkout(tmp_path: Path) -> None:
+def test_modified_run_branch_blocks_without_mutating_checkout(tmp_path: Path) -> None:
     repository, _, store, record, snapshot = snapshotted_change_set(tmp_path)
     (repository / "tracked.txt").write_text("conflicting current branch\n")
     git(repository, "add", "tracked.txt")
     git(repository, "commit", "-qm", "conflict")
     captured_head = head_commit(repository)
+    branch = store.run_branch(record.run_id)
+    assert branch is not None
+    git(repository, "update-ref", f"refs/heads/{branch.branch_name}", captured_head)
     record = store.accept_change_set(
         run_id=record.run_id,
         snapshot_commit=snapshot.commit,
@@ -235,7 +268,7 @@ def test_cherry_pick_conflict_aborts_and_restores_checkout(tmp_path: Path) -> No
         change_set_revision=1,
     )
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="modified"):
         apply_accepted_snapshot(
             store=store,
             change_set=record,
@@ -253,12 +286,106 @@ def test_cherry_pick_conflict_aborts_and_restores_checkout(tmp_path: Path) -> No
         )
         == ""
     )
-    assert store.handoff(record.run_id)["state"] == "blocked"
 
 
-def test_dirty_target_checkout_is_never_mutated(tmp_path: Path) -> None:
+def test_cleanup_deletes_only_the_exact_merged_run_ref(tmp_path: Path) -> None:
+    repository, worktree, store, record, snapshot = snapshotted_change_set(tmp_path)
+    record = store.accept_change_set(
+        run_id=record.run_id,
+        snapshot_commit=snapshot.commit,
+        snapshot_tree=snapshot.tree,
+        validation_revision=0,
+        change_set_revision=1,
+    )
+    apply_accepted_snapshot(store=store, change_set=record, checkout=repository)
+    branch = store.run_branch(record.run_id)
+    assert branch is not None
+    store.mark_run_branch_published(record.run_id, snapshot.commit)
+    store.mark_run_branch_merged(record.run_id, snapshot.commit)
+    store.record_worktree(
+        run_id=record.run_id,
+        project_id=branch.project_id,
+        repository_path=repository,
+        path=worktree,
+    )
+    checkout_head = head_commit(repository)
+
+    cleanup_merged_publication(
+        store=store,
+        run_id=str(record.run_id),
+        accepted_head=snapshot.commit,
+        accepted_tree=snapshot.tree,
+    )
+
+    assert not worktree.exists()
+    assert head_commit(repository) == checkout_head
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--verify", snapshot.ref],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "rev-parse",
+                "--verify",
+                f"refs/heads/{branch.branch_name}",
+            ],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+    cleaned = store.run_branch(record.run_id)
+    assert cleaned is not None and cleaned.state == "cleaned"
+
+
+def test_cleanup_cas_blocks_a_feature_branch_modified_after_publication(
+    tmp_path: Path,
+) -> None:
     repository, _, store, record, snapshot = snapshotted_change_set(tmp_path)
-    (repository / "manual.txt").write_text("manual\n")
+    record = store.accept_change_set(
+        run_id=record.run_id,
+        snapshot_commit=snapshot.commit,
+        snapshot_tree=snapshot.tree,
+        validation_revision=0,
+        change_set_revision=1,
+    )
+    apply_accepted_snapshot(store=store, change_set=record, checkout=repository)
+    branch = store.run_branch(record.run_id)
+    assert branch is not None
+    store.mark_run_branch_published(record.run_id, snapshot.commit)
+    store.mark_run_branch_merged(record.run_id, snapshot.commit)
+    git(
+        repository,
+        "update-ref",
+        f"refs/heads/{branch.branch_name}",
+        snapshot.base_commit,
+    )
+
+    with pytest.raises(RuntimeError, match="changed after publication"):
+        cleanup_merged_publication(
+            store=store,
+            run_id=str(record.run_id),
+            accepted_head=snapshot.commit,
+            accepted_tree=snapshot.tree,
+        )
+
+    assert (
+        git(repository, "rev-parse", f"refs/heads/{branch.branch_name}")
+        == snapshot.base_commit
+    )
+    assert git(repository, "rev-parse", snapshot.ref) == snapshot.commit
+
+
+def test_handoff_is_idempotent_after_feature_ref_update(tmp_path: Path) -> None:
+    repository, _, store, record, snapshot = snapshotted_change_set(tmp_path)
     captured_head = head_commit(repository)
     record = store.accept_change_set(
         run_id=record.run_id,
@@ -268,12 +395,11 @@ def test_dirty_target_checkout_is_never_mutated(tmp_path: Path) -> None:
         change_set_revision=1,
     )
 
-    with pytest.raises(RuntimeError, match="not clean"):
-        apply_accepted_snapshot(
-            store=store,
-            change_set=record,
-            checkout=repository,
-        )
+    first = apply_accepted_snapshot(store=store, change_set=record, checkout=repository)
+    second = apply_accepted_snapshot(
+        store=store, change_set=record, checkout=repository
+    )
 
     assert head_commit(repository) == captured_head
-    assert (repository / "manual.txt").read_text() == "manual\n"
+    assert first == second
+    assert first.applied_commit == snapshot.commit

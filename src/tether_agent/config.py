@@ -57,6 +57,7 @@ class ProjectMapping(BaseModel):
     local_path: Path
     access: Literal["read", "write"] = "write"
     worktree_root: Path | None = None
+    remote_name: str | None = None
     remote_url: str | None = None
 
     @field_validator("local_path")
@@ -80,6 +81,8 @@ class ProjectMapping(BaseModel):
                 str(self.worktree_root.resolve(strict=False))
                 if self.worktree_root is not None
                 else "",
+                self.remote_name or "",
+                self.remote_url or "",
             )
         )
         return sha256(material.encode()).hexdigest()
@@ -131,6 +134,7 @@ class WorktreePolicy(BaseModel):
     accepted_retention_hours: int = Field(default=24, ge=0, le=720)
     failed_retention_hours: int = Field(default=72, ge=1, le=720)
     cancelled_retention_hours: int = Field(default=24, ge=1, le=720)
+    handoff_retention_days: int = Field(default=7, ge=1, le=365)
     max_total_bytes: int = Field(
         default=20 * 1024 * 1024 * 1024,
         ge=1024 * 1024 * 1024,
@@ -318,6 +322,8 @@ def serialize_profile_config(config: ProfileConfig) -> bytes:
             lines.append(f"worktree_root = {_toml_string(str(mapping.worktree_root))}")
         if mapping.remote_url is not None:
             lines.append(f"remote_url = {_toml_string(mapping.remote_url)}")
+        if mapping.remote_name is not None:
+            lines.append(f"remote_name = {_toml_string(mapping.remote_name)}")
         lines.append("")
     worktrees = config.worktrees
     lines.extend(
@@ -327,6 +333,7 @@ def serialize_profile_config(config: ProfileConfig) -> bytes:
             f"accepted_retention_hours = {worktrees.accepted_retention_hours}",
             f"failed_retention_hours = {worktrees.failed_retention_hours}",
             f"cancelled_retention_hours = {worktrees.cancelled_retention_hours}",
+            f"handoff_retention_days = {worktrees.handoff_retention_days}",
             f"max_total_bytes = {worktrees.max_total_bytes}",
             "",
         )
@@ -366,6 +373,7 @@ def _validate_mapping_repositories(settings: DaemonSettings) -> DaemonSettings:
         repository = inspect_repository(
             mapping.local_path,
             remote=mapping.remote_url,
+            remote_name=mapping.remote_name,
             allow_no_remote=mapping.remote_url is None,
         )
         if repository.root != mapping.local_path:

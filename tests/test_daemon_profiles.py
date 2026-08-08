@@ -126,8 +126,10 @@ async def test_registration_sends_configuration_revision(tmp_path: Path) -> None
 @pytest.mark.asyncio
 async def test_terminal_review_releases_persisted_port_reservation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, store, daemon = initialized_daemon(tmp_path)
+    monkeypatch.setattr(daemon.ports, "_range_available", lambda _start, _end: True)
     run_id = uuid4()
     store.save_claim(run_id, 1, "lease-secret", 0)
     daemon.ports.allocate(run_id=run_id, worker_slot=0)
@@ -203,6 +205,147 @@ async def test_control_plane_heartbeat_continues_independently(
     await task
 
     assert liveness_calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_one_failed_handoff_does_not_block_the_next_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, daemon = initialized_daemon(tmp_path)
+    daemon.installation_id = uuid4()
+    first = {"id": str(uuid4())}
+    second = {"id": str(uuid4())}
+    await daemon.api.close()
+    daemon.api = SimpleNamespace(
+        pending_handoffs=AsyncMock(return_value=[first, second]),
+    )
+    request = httpx.Request("POST", "https://tetherbrain.net/handoff/start")
+    reconcile = AsyncMock(
+        side_effect=[httpx.ConnectError("offline", request=request), None]
+    )
+    record_failure = AsyncMock()
+    monkeypatch.setattr(daemon, "_reconcile_handoff", reconcile)
+    monkeypatch.setattr(daemon, "_record_handoff_failure", record_failure)
+
+    await daemon._reconcile_handoffs()
+
+    assert reconcile.await_count == 2
+    record_failure.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_applied_handoff_recovers_after_completion_response_is_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, store, daemon = initialized_daemon(tmp_path)
+    daemon.installation_id = uuid4()
+    run_id = uuid4()
+    snapshot_commit = "a" * 40
+    snapshot_tree = "b" * 40
+    repository = tmp_path / "repository"
+    worktree = tmp_path / "worktree"
+    repository.mkdir()
+    worktree.mkdir()
+    store.begin_change_set(
+        run_id=run_id,
+        repository_path=repository,
+        worktree_path=worktree,
+        base_commit="0" * 40,
+    )
+    store.transition_change_set(
+        run_id,
+        expected_states=frozenset({"executing"}),
+        next_state="snapshotting",
+    )
+    store.transition_change_set(
+        run_id,
+        expected_states=frozenset({"snapshotting"}),
+        next_state="snapshot_ready",
+        values={
+            "snapshot_commit": snapshot_commit,
+            "snapshot_tree": snapshot_tree,
+        },
+    )
+    store.transition_change_set(
+        run_id,
+        expected_states=frozenset({"snapshot_ready"}),
+        next_state="review_ready",
+    )
+    store.accept_change_set(
+        run_id=run_id,
+        snapshot_commit=snapshot_commit,
+        snapshot_tree=snapshot_tree,
+        validation_revision=0,
+        change_set_revision=1,
+    )
+    store.begin_handoff(
+        run_id=run_id,
+        snapshot_commit=snapshot_commit,
+        snapshot_tree=snapshot_tree,
+        validation_revision=0,
+        change_set_revision=1,
+        checkout_path=repository,
+        common_directory=repository,
+        captured_head="0" * 40,
+        captured_branch="main",
+        captured_status="",
+        captured_index_digest="digest",
+        method="fast_forward",
+    )
+    store.finish_handoff(
+        run_id,
+        state="applied",
+        applied_commit=snapshot_commit,
+    )
+    store.schedule_handoff_retry(
+        run_id,
+        attempt_count=1,
+        next_retry_at=None,
+        error_code="server_transient",
+        error_message="Completion response was lost",
+    )
+    await daemon.api.close()
+    daemon.api = SimpleNamespace(
+        start_handoff=AsyncMock(return_value={"state": "applying"}),
+        complete_handoff=AsyncMock(
+            return_value={
+                "state": "awaiting_acknowledgement",
+                "pending_completion": {"reason": "handoff_ack_pending"},
+            }
+        ),
+        acknowledge_handoff=AsyncMock(return_value={"state": "completed"}),
+    )
+    monkeypatch.setattr(
+        "tether_agent.daemon.apply_accepted_snapshot",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an applied snapshot must not be applied twice")
+        ),
+    )
+
+    await daemon._reconcile_handoff(
+        {
+            "id": str(run_id),
+            "state": "handoff_blocked",
+            "change_set": {
+                "snapshot_commit": snapshot_commit,
+                "snapshot_tree": snapshot_tree,
+                "validation_revision": 0,
+                "change_set_revision": 1,
+                "accepted_snapshot_commit": snapshot_commit,
+                "accepted_snapshot_tree": snapshot_tree,
+                "accepted_validation_revision": 0,
+                "accepted_change_set_revision": 1,
+            },
+            "handoff_status": {"retry_revision": 1},
+        }
+    )
+
+    daemon.api.start_handoff.assert_awaited_once()
+    daemon.api.complete_handoff.assert_awaited_once()
+    daemon.api.acknowledge_handoff.assert_awaited_once()
+    assert store.change_set(run_id).state == "applied"
 
 
 @pytest.mark.asyncio

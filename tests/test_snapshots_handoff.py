@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -108,6 +109,36 @@ def test_acceptance_requires_exact_snapshot_binding(tmp_path: Path) -> None:
         change_set_revision=1,
     )
     assert accepted.state == "accepted"
+
+
+def test_handoff_retry_schedule_survives_store_reopen(tmp_path: Path) -> None:
+    _, _, store, record, snapshot = snapshotted_change_set(tmp_path)
+    store.accept_change_set(
+        run_id=record.run_id,
+        snapshot_commit=snapshot.commit,
+        snapshot_tree=snapshot.tree,
+        validation_revision=0,
+        change_set_revision=1,
+    )
+    next_retry_at = datetime.now(UTC) + timedelta(minutes=1)
+    store.schedule_handoff_retry(
+        record.run_id,
+        attempt_count=2,
+        next_retry_at=next_retry_at,
+        error_code="server_transient",
+        error_message="Tether Brain returned HTTP 500",
+    )
+
+    reopened = StateStore(store.path)
+    handoff = reopened.handoff(record.run_id)
+
+    assert handoff is not None
+    assert handoff["state"] == "retry_scheduled"
+    assert handoff["attempt_count"] == 2
+    assert handoff["last_error_message"] == "Tether Brain returned HTTP 500"
+    assert not reopened.handoff_retry_due(record.run_id, now=datetime.now(UTC))
+    assert reopened.consume_remote_handoff_retry(record.run_id, 1)
+    assert reopened.handoff_retry_due(record.run_id, now=datetime.now(UTC))
 
 
 def test_manual_edit_after_snapshot_supersedes_review_revision(

@@ -332,6 +332,22 @@ class TetherApi:
             raise AgentApiError(response)
         return response.json()
 
+    async def report_handoff_status(
+        self,
+        run_id: UUID,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/handoff/status",
+            json=payload,
+        )
+        if response.status_code in {404, 405}:
+            return None
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
     async def report_change_set_validation(
         self,
         run_id: UUID,

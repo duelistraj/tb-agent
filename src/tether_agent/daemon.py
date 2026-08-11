@@ -32,13 +32,14 @@ from tether_agent.publication import (
     publish_github_pull_request,
 )
 from tether_agent.runtime import RuntimeRegistry
-from tether_agent.snapshots import create_snapshot, head_commit
+from tether_agent.snapshots import create_snapshot, head_commit, tree_for_worktree
 from tether_agent.state import StateStore
 from tether_agent.worktrees import WorktreeManager
 
 logger = logging.getLogger(__name__)
 CONTROL_PLANE_INTERVAL_SECONDS = 25
 HANDOFF_RETRY_DELAYS_SECONDS = (5, 15, 30, 60, 120, 300)
+SUPPORTED_FEATURES = ("multi_task_runs_v1",)
 ACKNOWLEDGED_RESULT_STATES = frozenset(
     {"completion_pending", "review", "completed", "failed", "cancelled"}
 )
@@ -241,6 +242,7 @@ class AgentDaemon:
                 "daemon_version": __version__,
                 "configuration_revision": self.store.configuration_revision(),
                 "configured_capacity": self.settings.max_concurrent_runs,
+                "supported_features": list(SUPPORTED_FEATURES),
                 "capabilities": self._capabilities(),
             }
         )
@@ -376,6 +378,7 @@ class AgentDaemon:
                             self.installation_id,
                             worker_slot=worker_slot,
                             configured_capacity=self.settings.max_concurrent_runs,
+                            supported_features=SUPPORTED_FEATURES,
                         )
                         if claim is None:
                             break
@@ -401,6 +404,7 @@ class AgentDaemon:
                                 "daemon_version": __version__,
                                 "configured_capacity": self.settings.max_concurrent_runs,
                                 "active_run_count": 0,
+                                "supported_features": list(SUPPORTED_FEATURES),
                             }
                         )
                         await self._refresh_catalogs()
@@ -474,6 +478,17 @@ class AgentDaemon:
             self._heartbeat_loop(run_id, generation, lease_token, stop_heartbeat)
         )
         try:
+            if bool(run.get("is_batch")):
+                await self._execute_batch(
+                    run=run,
+                    run_id=run_id,
+                    generation=generation,
+                    lease_token=lease_token,
+                    heartbeat=heartbeat,
+                    worker_slot=worker_slot,
+                    namespace=namespace,
+                )
+                return
             pending_result = self.store.pending_result(run_id)
             directory: Path | None = None
             local_context: dict[str, Any] | None = None
@@ -751,6 +766,329 @@ class AgentDaemon:
             with suppress(asyncio.CancelledError, httpx.HTTPError):
                 await heartbeat
 
+    async def _execute_batch(
+        self,
+        *,
+        run: dict[str, Any],
+        run_id: UUID,
+        generation: int,
+        lease_token: str,
+        heartbeat: asyncio.Task[None],
+        worker_slot: int,
+        namespace: RunNamespace | None,
+    ) -> None:
+        del worker_slot
+        runtime = self.runtimes.get(str(run["runtime_kind"]))
+        model_value = run.get("model_id")
+        if not isinstance(model_value, str) or not model_value:
+            await self.api.state(
+                run_id,
+                generation,
+                lease_token,
+                "failed",
+                "Run has no immutable model selection.",
+            )
+            self.store.finish_run(run_id, "blocked")
+            return
+        model_id = model_value
+        reasoning_effort = run.get("reasoning_effort")
+        progress_number = 0
+        progress_last_sent_at = 0.0
+        progress_last_fingerprint: str | None = None
+        usage_sequence = 0
+        usage_supported = True
+        latest_usage: dict[str, Any] | None = None
+
+        async def progress(message: str, payload: dict[str, Any]) -> None:
+            nonlocal progress_last_fingerprint, progress_last_sent_at, progress_number
+            fingerprint = repr(
+                (
+                    run.get("current_task_id"),
+                    message,
+                    payload.get("semantic_key"),
+                    payload.get("repository_paths"),
+                )
+            )
+            now = time.monotonic()
+            if not payload.get("milestone", False) and (
+                fingerprint == progress_last_fingerprint
+                or now - progress_last_sent_at < 3
+            ):
+                return
+            progress_number += 1
+            await self.api.timeline(
+                run_id,
+                generation,
+                lease_token,
+                f"{run_id}:{generation}:batch-progress:{progress_number}",
+                self._remote_safe(message),
+                self._remote_safe({**payload, "task_id": run.get("current_task_id")}),
+            )
+            progress_last_fingerprint = fingerprint
+            progress_last_sent_at = now
+
+        async def token_usage(payload: dict[str, Any]) -> None:
+            nonlocal latest_usage, usage_sequence, usage_supported
+            latest_usage = payload
+            if not usage_supported:
+                return
+            usage_sequence += 1
+            try:
+                await self.api.token_usage(
+                    run_id,
+                    generation,
+                    lease_token,
+                    usage_sequence,
+                    payload,
+                )
+            except AgentApiError as exc:
+                if exc.response.status_code in {404, 405}:
+                    usage_supported = False
+                else:
+                    logger.warning(
+                        "Could not report live token usage for batch run %s: %s",
+                        run_id,
+                        exc,
+                    )
+            except httpx.TransportError as exc:
+                logger.warning(
+                    "Could not report live token usage for batch run %s: %s",
+                    run_id,
+                    exc,
+                )
+
+        pending_result = self.store.pending_result(run_id)
+        directory: Path | None = None
+        while pending_result is None:
+            tasks = list(run.get("tasks") or [])
+            current_task_id = UUID(str(run["current_task_id"]))
+            member = next(
+                (
+                    item
+                    for item in tasks
+                    if str(item["task_id"]) == str(current_task_id)
+                ),
+                None,
+            )
+            if member is None:
+                raise RuntimeError("Batch claim has no current task membership")
+            context = await self.api.context(run_id, generation, lease_token)
+            directory, local_context = self._prepare_projects(
+                context=context,
+                run_id=run_id,
+                agent_name=str(run.get("profile_name") or "agent"),
+                task_title=str(member.get("title") or "batch"),
+            )
+            if run.get("state") != "running":
+                run = await self.api.state(
+                    run_id,
+                    generation,
+                    lease_token,
+                    "running",
+                    effective_model_id=model_id,
+                    effective_reasoning_effort=reasoning_effort,
+                )
+            turn_revision = int(member["turn_revision"])
+            saved = self.store.task_turn_result(
+                run_id=run_id,
+                task_id=current_task_id,
+                turn_revision=turn_revision,
+            )
+            if saved is None:
+                self.store.begin_task_turn(
+                    run_id=run_id,
+                    task_id=current_task_id,
+                    ordinal=int(member["ordinal"]),
+                    turn_revision=turn_revision,
+                )
+                runtime_task = asyncio.create_task(
+                    runtime.run(
+                        run_id=run_id,
+                        context=local_context,
+                        working_directory=directory,
+                        model_id=model_id,
+                        reasoning_effort=reasoning_effort,
+                        environment=(namespace.environment() if namespace else {}),
+                        progress=progress,
+                        token_usage=token_usage,
+                    )
+                )
+                completed, _ = await asyncio.wait(
+                    {runtime_task, heartbeat}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if heartbeat in completed:
+                    runtime_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await runtime_task
+                    heartbeat_error = heartbeat.exception()
+                    if heartbeat_error is not None:
+                        raise heartbeat_error
+                    raise RuntimeError("Run heartbeat stopped unexpectedly")
+                result = await runtime_task
+            else:
+                result = {
+                    key: value
+                    for key, value in saved.items()
+                    if not key.startswith("_")
+                }
+            if (
+                result.get("effective_model_id") != model_id
+                or result.get("effective_reasoning_effort") != reasoning_effort
+            ):
+                result = {
+                    "status": "failed",
+                    "message": "Runtime selection changed during the batch.",
+                    "outputs": [],
+                    "completion_note": None,
+                    "effective_model_id": model_id,
+                    "effective_reasoning_effort": reasoning_effort,
+                }
+            if result["status"] in {"question", "blocked"}:
+                await self.api.comment(
+                    run_id,
+                    generation,
+                    lease_token,
+                    result["status"],
+                    self._remote_safe(result["message"]),
+                )
+                self.store.finish_run(run_id, str(result["status"]))
+                self.store.set_worktree_state(run_id, str(result["status"]))
+                return
+            if result["status"] == "failed":
+                blocked = await self.api.state(
+                    run_id,
+                    generation,
+                    lease_token,
+                    "failed",
+                    self._remote_safe(result["message"]),
+                )
+                self.store.finish_run(run_id, str(blocked["state"]))
+                self.store.set_worktree_state(run_id, str(blocked["state"]))
+                return
+            checkpoint_revision = int(member.get("checkpoint_revision") or 0) + 1
+            if saved is None:
+                worktree_tree = tree_for_worktree(directory)
+                self.store.save_task_turn_result(
+                    run_id=run_id,
+                    task_id=current_task_id,
+                    turn_revision=turn_revision,
+                    checkpoint_revision=checkpoint_revision,
+                    worktree_tree=worktree_tree,
+                    result=result,
+                )
+            else:
+                worktree_tree = str(saved["_worktree_tree"])
+                checkpoint_revision = int(saved["_checkpoint_revision"])
+            run = await self.api.checkpoint_task(
+                run_id,
+                current_task_id,
+                generation,
+                lease_token,
+                turn_revision=turn_revision,
+                checkpoint_revision=checkpoint_revision,
+                worktree_tree=worktree_tree,
+                summary=self._remote_safe(str(result["message"])),
+                token_usage=self._remote_safe(latest_usage),
+            )
+            self.store.acknowledge_task_turn(
+                run_id=run_id,
+                task_id=current_task_id,
+                turn_revision=turn_revision,
+            )
+            if int(run["current_task_ordinal"]) > int(member["ordinal"]):
+                latest_usage = None
+                continue
+            task_results = self.store.task_turn_results(run_id)
+            outputs = [
+                output
+                for task_result in task_results
+                for output in list(task_result.get("outputs") or [])
+            ]
+            notes = [
+                task_result.get("completion_note")
+                for task_result in task_results
+                if task_result.get("completion_note")
+            ]
+            pending_result = {
+                "status": "succeeded",
+                "message": f"Completed {len(task_results)} tasks in one execution batch.",
+                "outputs": outputs,
+                "completion_note": (
+                    {
+                        "title": "Batch execution summary",
+                        "markdown": "\n\n".join(
+                            str(note.get("markdown") or "")
+                            for note in notes
+                            if isinstance(note, dict)
+                        ),
+                    }
+                    if notes
+                    else None
+                ),
+                "effective_model_id": model_id,
+                "effective_reasoning_effort": reasoning_effort,
+            }
+            self.store.save_pending_result(run_id, pending_result)
+
+        assert directory is not None or self.store.change_set(run_id) is not None
+        result = pending_result
+        change_set = self.store.change_set(run_id)
+        if change_set is None:
+            raise RuntimeError("Batch run has no local change set")
+        if change_set.state == "executing":
+            change_set = self.store.transition_change_set(
+                run_id,
+                expected_states=frozenset({"executing"}),
+                next_state="snapshotting",
+            )
+        if change_set.state == "snapshotting":
+            snapshot = create_snapshot(
+                repository=change_set.repository_path,
+                worktree=change_set.worktree_path,
+                run_id=run_id,
+                base_commit=change_set.base_commit,
+            )
+            change_set = self.store.transition_change_set(
+                run_id,
+                expected_states=frozenset({"snapshotting"}),
+                next_state="snapshot_ready",
+                values={
+                    "snapshot_commit": snapshot.commit,
+                    "snapshot_tree": snapshot.tree,
+                },
+            )
+        if change_set.state == "snapshot_ready":
+            change_set = self.store.transition_change_set(
+                run_id,
+                expected_states=frozenset({"snapshot_ready"}),
+                next_state="review_ready",
+            )
+        if (
+            change_set.state != "review_ready"
+            or change_set.snapshot_commit is None
+            or change_set.snapshot_tree is None
+        ):
+            raise RuntimeError(f"Batch change set is not ready: {change_set.state}")
+        result["change_set"] = {
+            "snapshot_commit": change_set.snapshot_commit,
+            "snapshot_tree": change_set.snapshot_tree,
+            "base_commit": change_set.base_commit,
+            "validation_revision": change_set.validation_revision,
+            "validation_status": change_set.validation_status,
+            "change_set_revision": change_set.change_set_revision,
+        }
+        self.store.save_pending_result(run_id, result)
+        completed_run = await self._complete_with_retry(
+            run_id=run_id,
+            generation=generation,
+            lease_token=lease_token,
+            task_version=int(run["task_version"]),
+            result=result,
+        )
+        self.store.clear_pending_result(run_id)
+        self.store.finish_run(run_id, str(completed_run["state"]))
+        self.store.set_worktree_state(run_id, str(completed_run["state"]))
+
     async def _complete_with_retry(
         self,
         *,
@@ -805,6 +1143,7 @@ class AgentDaemon:
                         "daemon_version": __version__,
                         "configured_capacity": self.settings.max_concurrent_runs,
                         "active_run_count": len(self.store.active_run_ids()),
+                        "supported_features": list(SUPPORTED_FEATURES),
                     }
                 )
                 await self._refresh_catalogs()

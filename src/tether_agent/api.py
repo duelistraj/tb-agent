@@ -141,6 +141,7 @@ class TetherApi:
         *,
         worker_slot: int = 0,
         configured_capacity: int = 1,
+        supported_features: tuple[str, ...] = (),
     ) -> dict[str, Any] | None:
         response = await self._request(
             "POST",
@@ -149,11 +150,42 @@ class TetherApi:
                 "installation_id": str(installation_id),
                 "worker_slot": worker_slot,
                 "configured_capacity": configured_capacity,
+                "supported_features": list(supported_features),
             },
         )
         if response.status_code == 204:
             return None
         response.raise_for_status()
+        return response.json()
+
+    async def checkpoint_task(
+        self,
+        run_id: UUID,
+        task_id: UUID,
+        generation: int,
+        lease_token: str,
+        *,
+        turn_revision: int,
+        checkpoint_revision: int,
+        worktree_tree: str,
+        summary: str,
+        token_usage: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/tasks/{task_id}/checkpoint",
+            json={
+                "generation": generation,
+                "lease_token": lease_token,
+                "turn_revision": turn_revision,
+                "checkpoint_revision": checkpoint_revision,
+                "worktree_tree": worktree_tree,
+                "summary": summary,
+                "token_usage": token_usage,
+            },
+        )
+        if response.is_error:
+            raise AgentApiError(response)
         return response.json()
 
     async def run(self, run_id: UUID) -> dict[str, Any]:

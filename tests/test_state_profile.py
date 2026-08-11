@@ -91,6 +91,58 @@ def test_state_backup_preserves_identity_leases_and_threads(tmp_path: Path) -> N
     }
 
 
+def test_task_turn_journal_recovers_results_in_batch_order(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state/state.sqlite3")
+    run_id = uuid4()
+    first_task_id = uuid4()
+    second_task_id = uuid4()
+    store.save_claim(run_id, 1, "lease-secret")
+
+    for ordinal, task_id in enumerate((first_task_id, second_task_id)):
+        store.begin_task_turn(
+            run_id=run_id,
+            task_id=task_id,
+            ordinal=ordinal,
+            turn_revision=1,
+        )
+        store.save_task_turn_result(
+            run_id=run_id,
+            task_id=task_id,
+            turn_revision=1,
+            checkpoint_revision=1,
+            worktree_tree=str(ordinal + 1) * 40,
+            result={
+                "status": "succeeded",
+                "message": f"Task {ordinal + 1} complete",
+                "outputs": [],
+            },
+        )
+        store.acknowledge_task_turn(
+            run_id=run_id,
+            task_id=task_id,
+            turn_revision=1,
+        )
+
+    recovered = store.task_turn_results(run_id)
+
+    assert [item["task_id"] for item in recovered] == [
+        str(first_task_id),
+        str(second_task_id),
+    ]
+    assert [item["message"] for item in recovered] == [
+        "Task 1 complete",
+        "Task 2 complete",
+    ]
+    assert (
+        store.task_turn_result(
+            run_id=run_id,
+            task_id=first_task_id,
+            turn_revision=1,
+        )["_turn_state"]
+        == "checkpoint_acknowledged"
+    )
+
+
 def test_state_backup_closes_every_sqlite_connection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

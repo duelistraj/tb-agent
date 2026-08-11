@@ -82,8 +82,9 @@ class FakeServerApi:
         *,
         worker_slot: int = 0,
         configured_capacity: int = 1,
+        supported_features: tuple[str, ...] = (),
     ) -> None:
-        del installation_id, worker_slot, configured_capacity
+        del installation_id, worker_slot, configured_capacity, supported_features
         self.claim_count += 1
 
     async def liveness(self, payload: dict) -> dict:

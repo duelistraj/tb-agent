@@ -2,7 +2,7 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -80,8 +80,9 @@ class PendingApi:
         *,
         worker_slot: int = 0,
         configured_capacity: int = 1,
+        supported_features: tuple[str, ...] = (),
     ) -> None:
-        del installation_id, worker_slot, configured_capacity
+        del installation_id, worker_slot, configured_capacity, supported_features
         self.claim_calls += 1
 
     async def close(self) -> None:
@@ -409,6 +410,147 @@ async def test_reclaimed_run_resubmits_saved_result_without_running_codex(
     assert len(completed_payloads) == 1
     runtime.run.assert_not_awaited()
     assert store.pending_result(run_id) is None
+
+
+@pytest.mark.asyncio
+async def test_batch_runs_tasks_sequentially_in_one_thread_and_snapshots_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, store, daemon = initialized_daemon(tmp_path)
+    run_id = uuid4()
+    first_task_id = uuid4()
+    second_task_id = uuid4()
+    worktree = tmp_path / "worktree"
+    repository = tmp_path / "repository"
+    worktree.mkdir()
+    repository.mkdir()
+    store.begin_change_set(
+        run_id=run_id,
+        repository_path=repository,
+        worktree_path=worktree,
+        base_commit="a" * 40,
+    )
+    runtime_calls: list[object] = []
+
+    async def run_runtime(**kwargs: object) -> dict[str, object]:
+        runtime_calls.append(kwargs)
+        if len(runtime_calls) == 1:
+            store.save_thread(run_id, "shared-codex-thread")
+        else:
+            assert store.thread_id(run_id) == "shared-codex-thread"
+        ordinal = len(runtime_calls)
+        return {
+            "status": "succeeded",
+            "message": f"Task {ordinal} completed",
+            "outputs": [],
+            "completion_note": None,
+            "effective_model_id": "gpt-test",
+            "effective_reasoning_effort": "high",
+        }
+
+    runtime = SimpleNamespace(run=AsyncMock(side_effect=run_runtime))
+    daemon.runtimes = SimpleNamespace(get=lambda _: runtime)
+    monkeypatch.setattr(
+        daemon,
+        "_prepare_projects",
+        lambda **kwargs: (worktree, kwargs["context"]),
+    )
+    monkeypatch.setattr(
+        "tether_agent.daemon.tree_for_worktree",
+        lambda _path: "b" * 40,
+    )
+    snapshots: list[UUID] = []
+
+    def snapshot_once(**kwargs: object) -> SimpleNamespace:
+        snapshots.append(kwargs["run_id"])
+        return SimpleNamespace(commit="c" * 40, tree="d" * 40)
+
+    monkeypatch.setattr("tether_agent.daemon.create_snapshot", snapshot_once)
+    tasks = [
+        {
+            "task_id": str(first_task_id),
+            "ordinal": 0,
+            "title": "First task",
+            "state": "pending",
+            "turn_revision": 1,
+            "checkpoint_revision": 0,
+        },
+        {
+            "task_id": str(second_task_id),
+            "ordinal": 1,
+            "title": "Second task",
+            "state": "pending",
+            "turn_revision": 1,
+            "checkpoint_revision": 0,
+        },
+    ]
+    run_payload: dict[str, object] = {
+        "id": str(run_id),
+        "lease_generation": 1,
+        "runtime_kind": "codex_cli",
+        "model_id": "gpt-test",
+        "reasoning_effort": "high",
+        "task_version": 7,
+        "profile_name": "Codex",
+        "state": "claimed",
+        "is_batch": True,
+        "current_task_id": str(first_task_id),
+        "current_task_ordinal": 0,
+        "tasks": tasks,
+    }
+    checkpoints: list[UUID] = []
+    completions: list[tuple[object, ...]] = []
+
+    class Api:
+        async def context(self, *args: object) -> dict[str, object]:
+            del args
+            return {"items": []}
+
+        async def state(self, *args: object, **kwargs: object) -> dict[str, object]:
+            del args, kwargs
+            run_payload["state"] = "running"
+            return run_payload
+
+        async def checkpoint_task(
+            self, _run_id: object, task_id: UUID, *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            checkpoints.append(task_id)
+            tasks[len(checkpoints) - 1]["state"] = "completed"
+            if len(checkpoints) == 1:
+                run_payload["current_task_id"] = str(second_task_id)
+                run_payload["current_task_ordinal"] = 1
+            return run_payload
+
+        async def complete(self, *args: object, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            completions.append(args)
+            return {"state": "review"}
+
+        async def timeline(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def token_usage(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def heartbeat(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    await daemon.api.close()
+    daemon.api = Api()
+
+    await daemon._execute({"lease_token": "batch-lease", "run": run_payload})
+
+    assert checkpoints == [first_task_id, second_task_id]
+    assert len(runtime_calls) == 2
+    assert {call["run_id"] for call in runtime_calls} == {run_id}
+    assert snapshots == [run_id]
+    assert len(completions) == 1
+    assert store.pending_result(run_id) is None
+    assert [item["message"] for item in store.task_turn_results(run_id)] == [
+        "Task 1 completed",
+        "Task 2 completed",
+    ]
 
 
 def test_remote_safe_redacts_arbitrary_absolute_paths_but_preserves_urls(

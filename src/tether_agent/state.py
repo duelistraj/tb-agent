@@ -186,6 +186,26 @@ class StateStore:
                     pending_result TEXT,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS run_task_turns (
+                    run_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    turn_revision INTEGER NOT NULL,
+                    checkpoint_revision INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL,
+                    worktree_tree TEXT,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(run_id, task_id, turn_revision),
+                    CHECK(ordinal >= 0),
+                    CHECK(turn_revision >= 1),
+                    CHECK(checkpoint_revision >= 0),
+                    CHECK(state IN (
+                        'prepared', 'running', 'result_saved',
+                        'checkpoint_acknowledged'
+                    ))
+                );
                 CREATE TABLE IF NOT EXISTS port_reservations (
                     run_id TEXT PRIMARY KEY,
                     worker_slot INTEGER NOT NULL,
@@ -1868,6 +1888,136 @@ class StateStore:
                 "UPDATE runs SET thread_id = ?, updated_at = ? WHERE run_id = ?",
                 (thread_id, datetime.now(UTC).isoformat(), str(run_id)),
             )
+
+    def begin_task_turn(
+        self,
+        *,
+        run_id: UUID,
+        task_id: UUID,
+        ordinal: int,
+        turn_revision: int,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connection(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO run_task_turns(
+                    run_id, task_id, ordinal, turn_revision, state,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'prepared', ?, ?)
+                ON CONFLICT(run_id, task_id, turn_revision) DO NOTHING
+                """,
+                (str(run_id), str(task_id), ordinal, turn_revision, now, now),
+            )
+            connection.execute(
+                """
+                UPDATE run_task_turns SET state = 'running', updated_at = ?
+                WHERE run_id = ? AND task_id = ? AND turn_revision = ?
+                  AND state = 'prepared'
+                """,
+                (now, str(run_id), str(task_id), turn_revision),
+            )
+
+    def task_turn_result(
+        self, *, run_id: UUID, task_id: UUID, turn_revision: int
+    ) -> dict[str, object] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT result_json, worktree_tree, checkpoint_revision, state
+                FROM run_task_turns
+                WHERE run_id = ? AND task_id = ? AND turn_revision = ?
+                """,
+                (str(run_id), str(task_id), turn_revision),
+            ).fetchone()
+        if row is None or not row["result_json"]:
+            return None
+        result = json.loads(str(row["result_json"]))
+        if not isinstance(result, dict):
+            return None
+        return {
+            **result,
+            "_worktree_tree": str(row["worktree_tree"]),
+            "_checkpoint_revision": int(row["checkpoint_revision"]),
+            "_turn_state": str(row["state"]),
+        }
+
+    def save_task_turn_result(
+        self,
+        *,
+        run_id: UUID,
+        task_id: UUID,
+        turn_revision: int,
+        checkpoint_revision: int,
+        worktree_tree: str,
+        result: dict[str, object],
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connection(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE run_task_turns
+                SET state = 'result_saved', checkpoint_revision = ?,
+                    worktree_tree = ?, result_json = ?, updated_at = ?
+                WHERE run_id = ? AND task_id = ? AND turn_revision = ?
+                  AND state IN ('running', 'result_saved')
+                """,
+                (
+                    checkpoint_revision,
+                    worktree_tree,
+                    json.dumps(result, separators=(",", ":"), sort_keys=True),
+                    now,
+                    str(run_id),
+                    str(task_id),
+                    turn_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Task turn is not ready to save a result")
+
+    def acknowledge_task_turn(
+        self, *, run_id: UUID, task_id: UUID, turn_revision: int
+    ) -> None:
+        with self.connection(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE run_task_turns
+                SET state = 'checkpoint_acknowledged', updated_at = ?
+                WHERE run_id = ? AND task_id = ? AND turn_revision = ?
+                  AND state IN ('result_saved', 'checkpoint_acknowledged')
+                """,
+                (
+                    datetime.now(UTC).isoformat(),
+                    str(run_id),
+                    str(task_id),
+                    turn_revision,
+                ),
+            )
+
+    def task_turn_results(self, run_id: UUID) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT task_id, ordinal, turn_revision, result_json
+                FROM run_task_turns
+                WHERE run_id = ? AND state = 'checkpoint_acknowledged'
+                ORDER BY ordinal, turn_revision DESC
+                """,
+                (str(run_id),),
+            ).fetchall()
+        newest_by_ordinal: dict[int, dict[str, object]] = {}
+        for row in rows:
+            ordinal = int(row["ordinal"])
+            if ordinal in newest_by_ordinal:
+                continue
+            value = json.loads(str(row["result_json"]))
+            if isinstance(value, dict):
+                newest_by_ordinal[ordinal] = {
+                    **value,
+                    "task_id": str(row["task_id"]),
+                    "ordinal": ordinal,
+                }
+        return [newest_by_ordinal[key] for key in sorted(newest_by_ordinal)]
 
     def pending_result(self, run_id: UUID) -> dict[str, object] | None:
         with self.connection() as connection:

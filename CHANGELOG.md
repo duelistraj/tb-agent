@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.11.0 - 2026-08-11
+
+### Added
+
+- Advertise ordered multi-task execution support to compatible Tether Brain servers.
+- Execute up to ten task turns sequentially in one run-owned worktree and one persistent Codex thread.
+- Persist each task result and tree checkpoint before advancing so daemon restarts resume without rerunning acknowledged turns.
+
+### Changed
+
+- Create one immutable snapshot, atomic review, feature branch, and pull request for the complete task batch.
+- Pause the complete batch on a question, blocker, or retryable task failure while retaining completed turn checkpoints.
+
 ## 0.10.0 - 2026-08-08
 
 ### Added

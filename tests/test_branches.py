@@ -2,6 +2,8 @@ import subprocess
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from tether_agent.branches import prepare_run_branch
 from tether_agent.config import ProjectMapping
 from tether_agent.state import StateStore
@@ -37,14 +39,19 @@ def initialized_remote(tmp_path: Path) -> tuple[Path, Path]:
 
 def test_existing_run_branch_reuses_captured_identity_when_title_and_upstream_move(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository, remote = initialized_remote(tmp_path)
+    monkeypatch.setattr(
+        "tether_agent.branches.resolve_remote",
+        lambda *_args, **_kwargs: ("origin", str(remote)),
+    )
     store = StateStore(tmp_path / "state" / "state.sqlite3")
     run_id = uuid4()
     mapping = ProjectMapping(
         project_id=uuid4(),
         local_path=repository,
-        remote_url=str(remote),
+        remote_url="https://example.test/owner/repository.git",
         remote_name="origin",
     )
 

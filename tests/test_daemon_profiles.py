@@ -201,7 +201,10 @@ async def test_control_plane_heartbeat_continues_independently(
     monkeypatch.setattr(daemon, "_refresh_catalogs", AsyncMock())
     stop = asyncio.Event()
     task = asyncio.create_task(daemon._control_plane_loop(stop))
-    await asyncio.sleep(0.04)
+    for _ in range(50):
+        if liveness_calls >= 2:
+            break
+        await asyncio.sleep(0.01)
     stop.set()
     await task
 
@@ -460,6 +463,7 @@ async def test_batch_runs_tasks_sequentially_in_one_thread_and_snapshots_once(
         "tether_agent.daemon.tree_for_worktree",
         lambda _path: "b" * 40,
     )
+    monkeypatch.setattr(daemon, "_git_tree", lambda *_args: "b" * 40)
     snapshots: list[UUID] = []
 
     def snapshot_once(**kwargs: object) -> SimpleNamespace:

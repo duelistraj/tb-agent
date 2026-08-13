@@ -32,14 +32,19 @@ from tether_agent.publication import (
     publish_github_pull_request,
 )
 from tether_agent.runtime import RuntimeRegistry
-from tether_agent.snapshots import create_snapshot, head_commit, tree_for_worktree
+from tether_agent.snapshots import (
+    create_snapshot,
+    head_commit,
+    restore_worktree_tree,
+    tree_for_worktree,
+)
 from tether_agent.state import StateStore
 from tether_agent.worktrees import WorktreeManager
 
 logger = logging.getLogger(__name__)
 CONTROL_PLANE_INTERVAL_SECONDS = 25
 HANDOFF_RETRY_DELAYS_SECONDS = (5, 15, 30, 60, 120, 300)
-SUPPORTED_FEATURES = ("multi_task_runs_v1",)
+SUPPORTED_FEATURES = ("multi_task_runs_v1", "multi_task_runs_v2")
 ACKNOWLEDGED_RESULT_STATES = frozenset(
     {"completion_pending", "review", "completed", "failed", "cancelled"}
 )
@@ -47,6 +52,12 @@ FILE_URI_PATTERN = re.compile(r"\bfile://[^\s,;)}\]]+")
 ABSOLUTE_PATH_PATTERN = re.compile(
     r"(?<![\w:/])(?:~[/\\]|/|[A-Za-z]:[/\\])[^\s,;)}\]]+"
 )
+
+
+class BatchRecoveryError(RuntimeError):
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class AgentDaemon:
@@ -479,15 +490,32 @@ class AgentDaemon:
         )
         try:
             if bool(run.get("is_batch")):
-                await self._execute_batch(
-                    run=run,
-                    run_id=run_id,
-                    generation=generation,
-                    lease_token=lease_token,
-                    heartbeat=heartbeat,
-                    worker_slot=worker_slot,
-                    namespace=namespace,
-                )
+                try:
+                    await self._execute_batch(
+                        run=run,
+                        run_id=run_id,
+                        generation=generation,
+                        lease_token=lease_token,
+                        heartbeat=heartbeat,
+                        worker_slot=worker_slot,
+                        namespace=namespace,
+                    )
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    failure_code = (
+                        exc.code
+                        if isinstance(exc, BatchRecoveryError)
+                        else "agent_internal_error"
+                    )
+                    failed = await self.api.state(
+                        run_id,
+                        generation,
+                        lease_token,
+                        "failed",
+                        self._remote_safe(str(exc)),
+                        failure_code=failure_code,
+                    )
+                    self.store.finish_run(run_id, str(failed["state"]))
+                    self.store.set_worktree_state(run_id, str(failed["state"]))
                 return
             pending_result = self.store.pending_result(run_id)
             directory: Path | None = None
@@ -872,13 +900,45 @@ class AgentDaemon:
             )
             if member is None:
                 raise RuntimeError("Batch claim has no current task membership")
-            context = await self.api.context(run_id, generation, lease_token)
-            directory, local_context = self._prepare_projects(
-                context=context,
-                run_id=run_id,
-                agent_name=str(run.get("profile_name") or "agent"),
-                task_title=str(member.get("title") or "batch"),
+            for completed_member in tasks[: int(member["ordinal"])]:
+                if completed_member.get("state") != "completed":
+                    continue
+                self.store.acknowledge_task_turn(
+                    run_id=run_id,
+                    task_id=UUID(str(completed_member["task_id"])),
+                    turn_revision=int(completed_member["turn_revision"]),
+                )
+            recovering = (
+                int(run.get("resume_count") or 0) > 0
+                or int(run.get("recovery_count") or 0) > 0
+                or int(member["ordinal"]) > 0
             )
+            if recovering:
+                retained = self.store.change_set(run_id)
+                if retained is None or not retained.worktree_path.exists():
+                    raise BatchRecoveryError(
+                        "The retained batch worktree is no longer available",
+                        code="local_batch_artifacts_missing",
+                    )
+            context = await self.api.context(run_id, generation, lease_token)
+            try:
+                directory, local_context = self._prepare_projects(
+                    context=context,
+                    run_id=run_id,
+                    agent_name=str(run.get("profile_name") or "agent"),
+                    task_title=str(
+                        run.get("task_title") or member.get("title") or "batch"
+                    ),
+                )
+            except RuntimeError as exc:
+                if recovering:
+                    raise BatchRecoveryError(
+                        str(exc), code="local_batch_artifacts_changed"
+                    ) from exc
+                raise
+            change_set = self.store.change_set(run_id)
+            if change_set is None:
+                raise RuntimeError("Batch run has no local change set")
             if run.get("state") != "running":
                 run = await self.api.state(
                     run_id,
@@ -894,6 +954,34 @@ class AgentDaemon:
                 task_id=current_task_id,
                 turn_revision=turn_revision,
             )
+            checkpoint_tree = (
+                str(saved["_worktree_tree"])
+                if saved is not None
+                else next(
+                    (
+                        str(item["worktree_tree"])
+                        for item in reversed(tasks[: int(member["ordinal"])])
+                        if item.get("state") == "completed"
+                        and item.get("worktree_tree")
+                    ),
+                    None,
+                )
+            )
+            expected_tree = checkpoint_tree or self._git_tree(
+                change_set.repository_path,
+                change_set.base_commit,
+            )
+            if tree_for_worktree(directory) != expected_tree:
+                try:
+                    restore_worktree_tree(
+                        worktree=directory,
+                        base_commit=change_set.base_commit,
+                        expected_tree=expected_tree,
+                    )
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    raise BatchRecoveryError(
+                        str(exc), code="local_batch_artifacts_changed"
+                    ) from exc
             if saved is None:
                 self.store.begin_task_turn(
                     run_id=run_id,
@@ -1088,6 +1176,16 @@ class AgentDaemon:
         self.store.clear_pending_result(run_id)
         self.store.finish_run(run_id, str(completed_run["state"]))
         self.store.set_worktree_state(run_id, str(completed_run["state"]))
+
+    @staticmethod
+    def _git_tree(repository: Path, commit: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", f"{commit}^{{tree}}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
 
     async def _complete_with_retry(
         self,

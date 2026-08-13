@@ -221,6 +221,7 @@ class TetherApi:
         message: str | None = None,
         effective_model_id: str | None = None,
         effective_reasoning_effort: str | None = None,
+        failure_code: str | None = None,
     ) -> dict[str, Any]:
         response = await self._request(
             "POST",
@@ -230,6 +231,7 @@ class TetherApi:
                 "lease_token": lease_token,
                 "state": state,
                 "message": message,
+                "failure_code": failure_code,
                 "effective_model_id": effective_model_id,
                 "effective_reasoning_effort": effective_reasoning_effort,
             },

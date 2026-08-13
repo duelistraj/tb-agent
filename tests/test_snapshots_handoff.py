@@ -9,7 +9,13 @@ import pytest
 from tether_agent.changes import refresh_snapshot_state, validate_snapshot
 from tether_agent.handoff import apply_accepted_snapshot
 from tether_agent.publication import cleanup_merged_publication
-from tether_agent.snapshots import create_snapshot, head_commit, snapshot_is_current
+from tether_agent.snapshots import (
+    create_snapshot,
+    head_commit,
+    restore_worktree_tree,
+    snapshot_is_current,
+    tree_for_worktree,
+)
 from tether_agent.state import StateStore
 
 
@@ -99,6 +105,31 @@ def test_snapshot_has_exact_parent_ref_tree_and_run_trailer(tmp_path: Path) -> N
         repository, "show", "-s", "--format=%B", snapshot.commit
     )
     assert snapshot_is_current(worktree=worktree, snapshot_tree=snapshot.tree)
+
+
+def test_restore_worktree_tree_discards_only_uncheckpointed_changes(
+    tmp_path: Path,
+) -> None:
+    repository, base = initialized_repository(tmp_path)
+    worktree = tmp_path / "worktree"
+    git(repository, "worktree", "add", "--detach", str(worktree), base)
+    (worktree / "tracked.txt").write_text("checkpoint\n")
+    (worktree / "checkpoint.txt").write_text("saved\n")
+    checkpoint_tree = tree_for_worktree(worktree)
+    (worktree / "tracked.txt").write_text("partial retry work\n")
+    (worktree / "checkpoint.txt").unlink()
+    (worktree / "partial.txt").write_text("discard me\n")
+
+    restore_worktree_tree(
+        worktree=worktree,
+        base_commit=base,
+        expected_tree=checkpoint_tree,
+    )
+
+    assert (worktree / "tracked.txt").read_text() == "checkpoint\n"
+    assert (worktree / "checkpoint.txt").read_text() == "saved\n"
+    assert not (worktree / "partial.txt").exists()
+    assert tree_for_worktree(worktree) == checkpoint_tree
 
 
 def test_acceptance_requires_exact_snapshot_binding(tmp_path: Path) -> None:

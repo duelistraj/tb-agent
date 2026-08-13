@@ -119,6 +119,33 @@ def prepare_run_branch(
             "Another tb-agent process is updating this repository"
         ) from error
     try:
+        existing = store.run_branch(run_id)
+        if existing is not None:
+            identity = (
+                existing.project_id,
+                existing.repository_path.resolve(),
+                existing.remote_name,
+            )
+            if identity != (
+                mapping.project_id,
+                mapping.local_path.resolve(),
+                remote_name,
+            ):
+                raise RuntimeError("Run branch ownership does not match local state")
+            branch_ref = f"refs/heads/{existing.branch_name}"
+            current = _git(
+                mapping.local_path, "rev-parse", "--verify", branch_ref, check=False
+            )
+            if current not in {existing.base_commit, existing.feature_head}:
+                raise RuntimeError(
+                    f"Run branch {existing.branch_name} was modified and will not be overwritten"
+                )
+            return PreparedRunBranch(
+                branch_name=existing.branch_name,
+                remote_name=existing.remote_name,
+                upstream_ref=existing.upstream_ref,
+                base_commit=existing.base_commit,
+            )
         default_branch = _default_branch(mapping.local_path, remote_name, requested_ref)
         upstream_ref = f"refs/remotes/{remote_name}/{default_branch}"
         _git(

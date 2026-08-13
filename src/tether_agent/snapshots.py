@@ -58,6 +58,19 @@ def tree_for_worktree(worktree: Path) -> str:
         Path(index_name).unlink(missing_ok=True)
 
 
+def restore_worktree_tree(
+    *, worktree: Path, base_commit: str, expected_tree: str
+) -> None:
+    """Restore a run-owned detached worktree to an immutable checkpoint tree."""
+    if head_commit(worktree) != base_commit:
+        raise RuntimeError("Run worktree HEAD no longer matches its captured base")
+    _git(worktree, "cat-file", "-e", f"{expected_tree}^{{tree}}")
+    _git(worktree, "clean", "-ffd")
+    _git(worktree, "read-tree", "--reset", "-u", expected_tree)
+    if tree_for_worktree(worktree) != expected_tree:
+        raise RuntimeError("Run worktree could not be restored to its checkpoint")
+
+
 def create_snapshot(
     *,
     repository: Path,

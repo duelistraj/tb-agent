@@ -188,9 +188,117 @@ class TetherApi:
             raise AgentApiError(response)
         return response.json()
 
+    async def create_question(
+        self,
+        run_id: UUID,
+        generation: int,
+        lease_token: str,
+        *,
+        request_key: str,
+        questions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/questions",
+            json={
+                "generation": generation,
+                "lease_token": lease_token,
+                "request_key": request_key,
+                "questions": questions,
+            },
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
+    async def consume_question(
+        self,
+        run_id: UUID,
+        question_id: UUID,
+        generation: int,
+        lease_token: str,
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/questions/{question_id}/consume",
+            json={"generation": generation, "lease_token": lease_token},
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
+    async def suspend_question(
+        self,
+        run_id: UUID,
+        question_id: UUID,
+        generation: int,
+        lease_token: str,
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/questions/{question_id}/suspend",
+            json={"generation": generation, "lease_token": lease_token},
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
+    async def complete_plan(
+        self,
+        run_id: UUID,
+        generation: int,
+        lease_token: str,
+        *,
+        markdown: str,
+        codex_thread_id: str,
+        codex_turn_id: str,
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/complete-plan",
+            headers={"Idempotency-Key": f"plan:{run_id}:{codex_turn_id}"},
+            json={
+                "generation": generation,
+                "lease_token": lease_token,
+                "markdown": markdown,
+                "codex_thread_id": codex_thread_id,
+                "codex_turn_id": codex_turn_id,
+                "worktree_clean": True,
+                "file_change_items_emitted": False,
+            },
+        )
+        if response.is_error:
+            raise AgentApiError(response)
+        return response.json()
+
     async def run(self, run_id: UUID) -> dict[str, Any]:
         response = await self._request("GET", f"/api/agent/v1/runs/{run_id}")
         response.raise_for_status()
+        return response.json()
+
+    async def bind_plan_repository_bases(
+        self,
+        run_id: UUID,
+        generation: int,
+        lease_token: str,
+        bases: dict[UUID, str],
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            f"/api/agent/v1/runs/{run_id}/plan-repository-bases",
+            json={
+                "generation": generation,
+                "lease_token": lease_token,
+                "bases": [
+                    {"project_id": str(project_id), "commit": commit}
+                    for project_id, commit in sorted(
+                        bases.items(), key=lambda item: str(item[0])
+                    )
+                ],
+            },
+        )
+        if response.is_error:
+            raise AgentApiError(response)
         return response.json()
 
     async def heartbeat(self, run_id: UUID, generation: int, lease_token: str) -> None:

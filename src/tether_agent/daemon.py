@@ -21,7 +21,7 @@ from tether_agent import __version__
 from tether_agent.api import AgentApiError, TetherApi
 from tether_agent.branches import prepare_run_branch
 from tether_agent.changes import refresh_snapshot_state
-from tether_agent.config import DaemonSettings, load_effective_settings
+from tether_agent.config import DaemonSettings, ProjectMapping, load_effective_settings
 from tether_agent.handoff import apply_accepted_snapshot
 from tether_agent.locking import LockUnavailable, ProfileLock
 from tether_agent.oauth import refresh_credential
@@ -31,7 +31,7 @@ from tether_agent.publication import (
     cleanup_merged_publication,
     publish_github_pull_request,
 )
-from tether_agent.runtime import RuntimeRegistry
+from tether_agent.runtime import PlanSuspended, RuntimeRegistry
 from tether_agent.snapshots import (
     create_snapshot,
     head_commit,
@@ -43,8 +43,9 @@ from tether_agent.worktrees import WorktreeManager
 
 logger = logging.getLogger(__name__)
 CONTROL_PLANE_INTERVAL_SECONDS = 25
+PLAN_QUESTION_LIVE_WAIT_SECONDS = 15 * 60
 HANDOFF_RETRY_DELAYS_SECONDS = (5, 15, 30, 60, 120, 300)
-SUPPORTED_FEATURES = ("multi_task_runs_v1", "multi_task_runs_v2")
+BASE_SUPPORTED_FEATURES = ("multi_task_runs_v1", "multi_task_runs_v2")
 ACKNOWLEDGED_RESULT_STATES = frozenset(
     {"completion_pending", "review", "completed", "failed", "cancelled"}
 )
@@ -83,6 +84,12 @@ class AgentDaemon:
         self._last_catalog_refresh = 0.0
         self._loaded_revision = settings.config_revision
         self._mark_legacy_dirty_worktrees()
+
+    @property
+    def supported_features(self) -> tuple[str, ...]:
+        return tuple(
+            sorted({*BASE_SUPPORTED_FEATURES, *self.runtimes.supported_features()})
+        )
 
     def _mark_legacy_dirty_worktrees(self) -> None:
         for row in self.store.worktree_rows():
@@ -253,7 +260,7 @@ class AgentDaemon:
                 "daemon_version": __version__,
                 "configuration_revision": self.store.configuration_revision(),
                 "configured_capacity": self.settings.max_concurrent_runs,
-                "supported_features": list(SUPPORTED_FEATURES),
+                "supported_features": list(self.supported_features),
                 "capabilities": self._capabilities(),
             }
         )
@@ -389,7 +396,7 @@ class AgentDaemon:
                             self.installation_id,
                             worker_slot=worker_slot,
                             configured_capacity=self.settings.max_concurrent_runs,
-                            supported_features=SUPPORTED_FEATURES,
+                            supported_features=self.supported_features,
                         )
                         if claim is None:
                             break
@@ -415,7 +422,7 @@ class AgentDaemon:
                                 "daemon_version": __version__,
                                 "configured_capacity": self.settings.max_concurrent_runs,
                                 "active_run_count": 0,
-                                "supported_features": list(SUPPORTED_FEATURES),
+                                "supported_features": list(self.supported_features),
                             }
                         )
                         await self._refresh_catalogs()
@@ -489,6 +496,38 @@ class AgentDaemon:
             self._heartbeat_loop(run_id, generation, lease_token, stop_heartbeat)
         )
         try:
+            if str(run.get("mode") or "execute") == "plan":
+                try:
+                    await self._execute_plan(
+                        run=run,
+                        run_id=run_id,
+                        generation=generation,
+                        lease_token=lease_token,
+                        namespace=namespace,
+                    )
+                except AgentApiError as exc:
+                    if exc.recoverable:
+                        raise
+                    await self.api.comment(
+                        run_id,
+                        generation,
+                        lease_token,
+                        "blocker",
+                        self._remote_safe(exc.user_message),
+                    )
+                    self.store.finish_run(run_id, "blocked")
+                    self.ports.release(run_id)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    await self.api.comment(
+                        run_id,
+                        generation,
+                        lease_token,
+                        "blocker",
+                        self._remote_safe(str(exc)),
+                    )
+                    self.store.finish_run(run_id, "blocked")
+                    self.ports.release(run_id)
+                return
             if bool(run.get("is_batch")):
                 try:
                     await self._execute_batch(
@@ -793,6 +832,420 @@ class AgentDaemon:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError, httpx.HTTPError):
                 await heartbeat
+
+    async def _execute_plan(
+        self,
+        *,
+        run: dict[str, Any],
+        run_id: UUID,
+        generation: int,
+        lease_token: str,
+        namespace: RunNamespace | None,
+    ) -> None:
+        runtime = self.runtimes.get(str(run["runtime_kind"]))
+        run_plan = getattr(runtime, "run_plan", None)
+        if not callable(run_plan):
+            failed = await self.api.state(
+                run_id,
+                generation,
+                lease_token,
+                "failed",
+                "This runtime does not satisfy the native planning contract.",
+            )
+            self.store.finish_run(run_id, str(failed["state"]))
+            self.ports.release(run_id)
+            return
+        model_id = run.get("model_id")
+        if not isinstance(model_id, str) or not model_id:
+            failed = await self.api.state(
+                run_id,
+                generation,
+                lease_token,
+                "failed",
+                "Plan run has no immutable model selection.",
+            )
+            self.store.finish_run(run_id, str(failed["state"]))
+            self.ports.release(run_id)
+            return
+        pending = self.store.pending_result(run_id)
+        mapping: ProjectMapping | None = None
+        directory: Path | None = None
+        if pending is None:
+            run = await self._bind_plan_repository_bases(
+                run=run,
+                run_id=run_id,
+                generation=generation,
+                lease_token=lease_token,
+            )
+            context = await self.api.context(run_id, generation, lease_token)
+            directory, local_context, mapping = self._prepare_plan_project(
+                context=context,
+                run=run,
+                run_id=run_id,
+            )
+            outstanding = run.get("outstanding_question")
+            if isinstance(outstanding, dict) and outstanding.get("state") == "answered":
+                local_context["suspended_question_answer"] = (
+                    self._normalized_plan_answer(outstanding)
+                )
+            await self.api.state(
+                run_id,
+                generation,
+                lease_token,
+                "running",
+                effective_model_id=model_id,
+                effective_reasoning_effort=run.get("reasoning_effort"),
+            )
+
+            async def progress(message: str, payload: dict[str, Any]) -> None:
+                await self.api.timeline(
+                    run_id,
+                    generation,
+                    lease_token,
+                    f"{run_id}:{generation}:plan:{payload.get('semantic_key', 'work')}",
+                    self._remote_safe(message),
+                    self._remote_safe(payload),
+                )
+
+            usage_sequence = 0
+
+            async def token_usage(payload: dict[str, Any]) -> None:
+                nonlocal usage_sequence
+                usage_sequence += 1
+                await self.api.token_usage(
+                    run_id,
+                    generation,
+                    lease_token,
+                    usage_sequence,
+                    payload,
+                )
+
+            async def question(
+                request_key: str, questions: list[dict[str, Any]]
+            ) -> dict[str, list[str]]:
+                created = await self.api.create_question(
+                    run_id,
+                    generation,
+                    lease_token,
+                    request_key=request_key,
+                    questions=self._remote_safe(questions),
+                )
+                return await self._wait_for_plan_answer(
+                    run_id,
+                    UUID(str(created["id"])),
+                    generation,
+                    lease_token,
+                )
+
+            try:
+                result = await run_plan(
+                    run_id=run_id,
+                    context=local_context,
+                    working_directory=directory,
+                    model_id=model_id,
+                    reasoning_effort=run.get("reasoning_effort"),
+                    environment=namespace.environment() if namespace else {},
+                    progress=progress,
+                    token_usage=token_usage,
+                    question=question,
+                )
+            except PlanSuspended:
+                self.store.finish_run(run_id, "waiting_for_user")
+                self._remove_plan_worktree(run_id, mapping, directory)
+                self.ports.release(run_id)
+                return
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                if not self.worktrees.is_dirty(directory):
+                    self._remove_plan_worktree(run_id, mapping, directory)
+                raise
+            worktree_dirty = self.worktrees.is_dirty(directory)
+            if result.get("file_change_items_emitted") or worktree_dirty:
+                failed = await self.api.state(
+                    run_id,
+                    generation,
+                    lease_token,
+                    "failed",
+                    "Planning attempted to modify the read-only repository worktree.",
+                )
+                self.store.finish_run(run_id, str(failed["state"]))
+                self.store.set_worktree_state(run_id, str(failed["state"]))
+                if not worktree_dirty:
+                    self._remove_plan_worktree(run_id, mapping, directory)
+                self.ports.release(run_id)
+                return
+            safe_markdown = str(self._remote_safe(str(result["markdown"]))).strip()
+            if not safe_markdown or len(safe_markdown) > 100_000:
+                raise RuntimeError(
+                    "Codex returned a planning artifact outside the supported size"
+                )
+            result["markdown"] = safe_markdown
+            self.store.save_pending_result(run_id, result)
+            pending = result
+        if mapping is not None and directory is not None:
+            self._remove_plan_worktree(run_id, mapping, directory)
+        assert pending is not None
+        completed = await self.api.complete_plan(
+            run_id,
+            generation,
+            lease_token,
+            markdown=str(pending["markdown"]),
+            codex_thread_id=str(pending["codex_thread_id"]),
+            codex_turn_id=str(pending["codex_turn_id"]),
+        )
+        self.store.clear_pending_result(run_id)
+        self.store.finish_run(run_id, str(completed["state"]))
+        self.ports.release(run_id)
+
+    async def _wait_for_plan_answer(
+        self,
+        run_id: UUID,
+        question_id: UUID,
+        generation: int,
+        lease_token: str,
+    ) -> dict[str, list[str]]:
+        deadline = time.monotonic() + PLAN_QUESTION_LIVE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            remote = await self.api.run(run_id)
+            answer = self._live_plan_answer(remote, question_id)
+            if answer is not None:
+                await self.api.consume_question(
+                    run_id,
+                    question_id,
+                    generation,
+                    lease_token,
+                )
+                return answer
+            await asyncio.sleep(2)
+        suspended = await self.api.suspend_question(
+            run_id,
+            question_id,
+            generation,
+            lease_token,
+        )
+        raced_answer = self._live_plan_answer(suspended, question_id)
+        if raced_answer is not None:
+            await self.api.consume_question(
+                run_id,
+                question_id,
+                generation,
+                lease_token,
+            )
+            return raced_answer
+        raise PlanSuspended("Planning is waiting for a recorded user answer")
+
+    @staticmethod
+    def _live_plan_answer(
+        run: dict[str, Any], question_id: UUID
+    ) -> dict[str, list[str]] | None:
+        current = run.get("outstanding_question")
+        if not (
+            isinstance(current, dict)
+            and current.get("id") == str(question_id)
+            and current.get("state") == "answered"
+            and isinstance(current.get("answers"), dict)
+        ):
+            return None
+        return {
+            str(key): [str(value) for value in values]
+            for key, values in current["answers"].items()
+            if isinstance(values, list)
+        }
+
+    async def _bind_plan_repository_bases(
+        self,
+        *,
+        run: dict[str, Any],
+        run_id: UUID,
+        generation: int,
+        lease_token: str,
+    ) -> dict[str, Any]:
+        projects = [
+            item
+            for item in run.get("project_snapshot", [])
+            if item.get("mapping_requirement") == "required"
+        ]
+        if not projects:
+            raise RuntimeError("A Plan run requires one mapped logical project")
+        existing = run.get("plan_repository_bases")
+        existing_by_project = existing if isinstance(existing, dict) else {}
+        bases: dict[UUID, str] = {}
+        for project in projects:
+            project_id = UUID(str(project["id"]))
+            mapping = next(
+                (
+                    item
+                    for item in self.settings.project_mappings
+                    if item.project_id == project_id
+                ),
+                None,
+            )
+            if mapping is None:
+                raise RuntimeError(
+                    f"Plan run project {project_id} has no approved local mapping"
+                )
+            captured = existing_by_project.get(str(project_id))
+            if isinstance(captured, str):
+                self._verify_plan_base(mapping.local_path, captured)
+                bases[project_id] = captured
+                continue
+            bases[project_id] = self._resolve_plan_base(
+                mapping=mapping,
+                requested_ref=project.get("ref"),
+            )
+        if existing_by_project:
+            if {str(project_id): commit for project_id, commit in bases.items()} != (
+                existing_by_project
+            ):
+                raise RuntimeError(
+                    "The persisted planning repository bases do not match this run"
+                )
+            return run
+        return await self.api.bind_plan_repository_bases(
+            run_id,
+            generation,
+            lease_token,
+            bases,
+        )
+
+    @staticmethod
+    def _verify_plan_base(repository: Path, commit: str) -> None:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "rev-parse",
+                "--verify",
+                f"{commit}^{{commit}}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or result.stdout.strip() != commit:
+            raise RuntimeError(
+                "The exact planning repository base is unavailable locally"
+            )
+
+    @classmethod
+    def _resolve_plan_base(
+        cls,
+        *,
+        mapping: ProjectMapping,
+        requested_ref: object,
+    ) -> str:
+        if not isinstance(requested_ref, str) or not requested_ref.strip():
+            raise RuntimeError(
+                "The logical project has no configured default ref. Configure one "
+                "before starting a Plan run."
+            )
+        ref = requested_ref.strip()
+        if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", ref):
+            cls._verify_plan_base(mapping.local_path, ref)
+            return ref
+        if mapping.remote_name is None:
+            raise RuntimeError(
+                "The repository has no explicitly selected Git remote. Re-add the "
+                "workspace mapping with --remote-name."
+            )
+        if ref.startswith("refs/") and not ref.startswith("refs/heads/"):
+            raise RuntimeError("The configured default ref is not a valid branch")
+        branch = ref.removeprefix("refs/heads/")
+        if not branch:
+            raise RuntimeError("The configured default ref is not a valid branch")
+        valid = subprocess.run(
+            ["git", "check-ref-format", f"refs/heads/{branch}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if valid.returncode != 0:
+            raise RuntimeError("The configured default ref is not a valid branch")
+        remote_ref = f"refs/remotes/{mapping.remote_name}/{branch}"
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(mapping.local_path),
+                "rev-parse",
+                "--verify",
+                f"{remote_ref}^{{commit}}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        commit = result.stdout.strip()
+        if result.returncode != 0 or not re.fullmatch(
+            r"[0-9a-f]{40}(?:[0-9a-f]{24})?", commit
+        ):
+            raise RuntimeError(
+                f"Configured default branch {branch!r} is not available from the "
+                f"selected remote {mapping.remote_name!r}. Fetch it or correct the "
+                "workspace repository settings."
+            )
+        return commit
+
+    def _prepare_plan_project(
+        self,
+        *,
+        context: dict[str, Any],
+        run: dict[str, Any],
+        run_id: UUID,
+    ) -> tuple[Path, dict[str, Any], ProjectMapping]:
+        local_context = copy.deepcopy(context)
+        project_items = [
+            item for item in local_context["items"] if item["kind"] == "project"
+        ]
+        primary_items = [
+            item for item in project_items if item["payload"].get("is_primary")
+        ]
+        if len(primary_items) != 1:
+            raise RuntimeError("A Plan run requires one primary logical project")
+        project = primary_items[0]["payload"]
+        project_id = UUID(str(project["id"]))
+        mapping = next(
+            (
+                item
+                for item in self.settings.project_mappings
+                if item.project_id == project_id
+            ),
+            None,
+        )
+        if mapping is None:
+            raise RuntimeError("The Plan run has no approved local mapping")
+        base_commit = str(project.get("ref") or "")
+        if len(base_commit) not in {40, 64}:
+            raise RuntimeError("The Plan run has no exact captured repository base")
+        directory = self.worktrees.planning_directory(mapping, run_id, base_commit)
+        self.store.record_worktree(
+            run_id=run_id,
+            project_id=mapping.project_id,
+            repository_path=mapping.local_path,
+            path=directory,
+        )
+        project["local_checkout"] = str(directory)
+        project["read_only"] = True
+        return directory, local_context, mapping
+
+    def _remove_plan_worktree(
+        self,
+        run_id: UUID,
+        mapping: ProjectMapping,
+        directory: Path,
+    ) -> None:
+        if directory.exists():
+            if self.worktrees.is_dirty(directory):
+                raise RuntimeError("Refusing to remove a dirty planning worktree")
+            self.worktrees.remove(mapping.local_path, directory)
+        self.store.delete_worktree(run_id, mapping.project_id)
+
+    @staticmethod
+    def _normalized_plan_answer(question: dict[str, Any]) -> str:
+        normalized = question.get("normalized_answer")
+        if not isinstance(normalized, str) or not normalized.strip():
+            raise TypeError("Suspended planning answer is missing its server record")
+        return normalized
 
     async def _execute_batch(
         self,
@@ -1241,7 +1694,7 @@ class AgentDaemon:
                         "daemon_version": __version__,
                         "configured_capacity": self.settings.max_concurrent_runs,
                         "active_run_count": len(self.store.active_run_ids()),
-                        "supported_features": list(SUPPORTED_FEATURES),
+                        "supported_features": list(self.supported_features),
                     }
                 )
                 await self._refresh_catalogs()

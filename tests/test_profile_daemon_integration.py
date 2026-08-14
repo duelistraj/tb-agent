@@ -19,6 +19,9 @@ from tether_agent.state import StateStore
 
 
 class FakeRuntimeRegistry:
+    def supported_features(self) -> tuple[str, ...]:
+        return ()
+
     def capabilities(self) -> list[dict[str, str]]:
         return [
             {

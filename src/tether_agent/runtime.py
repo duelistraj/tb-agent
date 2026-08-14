@@ -9,18 +9,26 @@ import shutil
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from hashlib import sha256
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID
 
-from openai_codex import AsyncCodex, CodexConfig, Sandbox
+from codex_cli_bin import bundled_codex_path
+from openai_codex import AsyncCodex, CodexConfig, CodexError, Sandbox
+from openai_codex.client import CodexClient
 
+from tether_agent.codex_contract import PLAN_FEATURES, detect_codex_planning_contract
 from tether_agent.config import RuntimeAdapterSettings
 from tether_agent.state import StateStore
 
 ProgressCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 TokenUsageCallback = Callable[[dict[str, Any]], Awaitable[None]]
+QuestionCallback = Callable[
+    [str, list[dict[str, Any]]], Awaitable[dict[str, list[str]]]
+]
 TOKEN_USAGE_REPORT_INTERVAL_SECONDS = 2.0
 DAEMON_SECRET_ENVIRONMENT_KEYS = frozenset(
     {
@@ -28,6 +36,10 @@ DAEMON_SECRET_ENVIRONMENT_KEYS = frozenset(
         "TETHER_AGENT_OAUTH_REFRESH_TOKEN",
     }
 )
+
+
+class PlanSuspended(RuntimeError):
+    """The live Codex turn ended after its bounded user-input wait."""
 
 
 def _child_environment(overrides: dict[str, str]) -> dict[str, str]:
@@ -284,6 +296,16 @@ def _final_response_from_items(items: list[Any]) -> str | None:
     return fallback
 
 
+def _completed_plan_item(item: Any) -> tuple[bool, str | None]:
+    value = getattr(item, "root", item)
+    item_type = _enum_value(getattr(value, "type", None))
+    if item_type == "fileChange":
+        return True, None
+    if item_type == "plan":
+        return False, str(getattr(value, "text", "")).strip() or None
+    return False, None
+
+
 class RuntimeAdapter(Protocol):
     runtime_kind: str
 
@@ -429,6 +451,12 @@ class CodexRuntime:
         self.sandbox = (
             Sandbox.read_only if sandbox == "read_only" else Sandbox.workspace_write
         )
+        self.planning_contract = detect_codex_planning_contract(
+            Path(bundled_codex_path())
+        )
+
+    def supported_features(self) -> tuple[str, ...]:
+        return PLAN_FEATURES if self.planning_contract.supported else ()
 
     def capability(self) -> dict[str, str | None]:
         package_version = version("openai-codex")
@@ -627,6 +655,210 @@ class CodexRuntime:
                 "effective_reasoning_effort": reasoning_effort,
             }
 
+    async def run_plan(
+        self,
+        *,
+        run_id: UUID,
+        context: dict[str, Any],
+        working_directory: Path,
+        model_id: str,
+        reasoning_effort: str | None,
+        environment: dict[str, str],
+        progress: ProgressCallback,
+        token_usage: TokenUsageCallback,
+        question: QuestionCallback,
+    ) -> dict[str, Any]:
+        if not self.planning_contract.supported:
+            raise RuntimeError("The installed Codex runtime contract cannot run Plan")
+        loop = asyncio.get_running_loop()
+        return await asyncio.to_thread(
+            self._run_plan_sync,
+            loop,
+            run_id,
+            context,
+            working_directory,
+            model_id,
+            reasoning_effort,
+            environment,
+            progress,
+            token_usage,
+            question,
+        )
+
+    def _run_plan_sync(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        run_id: UUID,
+        context: dict[str, Any],
+        working_directory: Path,
+        model_id: str,
+        reasoning_effort: str | None,
+        environment: dict[str, str],
+        progress: ProgressCallback,
+        token_usage: TokenUsageCallback,
+        question: QuestionCallback,
+    ) -> dict[str, Any]:
+        file_change_emitted = False
+        final_plan: str | None = None
+        thread_id = self.store.thread_id(run_id)
+        turn_id: str | None = None
+
+        def await_main(coroutine: Awaitable[Any]) -> Any:
+            return asyncio.run_coroutine_threadsafe(coroutine, loop).result()
+
+        def approval_handler(
+            method: str, params: dict[str, Any] | None
+        ) -> dict[str, Any]:
+            if method != "item/tool/requestUserInput" or params is None:
+                return {}
+            raw_questions = params.get("questions")
+            if not isinstance(raw_questions, list):
+                raise TypeError("Codex sent an invalid structured question")
+            questions = [item for item in raw_questions if isinstance(item, dict)]
+            request_key = sha256(
+                json.dumps(
+                    {
+                        "thread_id": params.get("threadId"),
+                        "turn_id": params.get("turnId"),
+                        "item_id": params.get("itemId"),
+                    },
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()
+            answers = await_main(question(request_key, questions))
+            return {
+                "answers": {
+                    question_id: {"answers": values}
+                    for question_id, values in answers.items()
+                }
+            }
+
+        child_environment = _child_environment(environment)
+        config = CodexConfig(env=child_environment)
+        with CodexClient(config=config, approval_handler=approval_handler) as client:
+            client.initialize()
+            if thread_id is None:
+                started = client.thread_start(
+                    {
+                        "cwd": str(working_directory),
+                        "sandbox": "read-only",
+                        "developerInstructions": (
+                            "Create a detailed implementation plan only. Do not edit "
+                            "files. Ask a structured question only when a material "
+                            "decision cannot be recovered from the task or repository."
+                        ),
+                    }
+                )
+                thread_id = started.thread.id
+                self.store.save_thread(run_id, thread_id)
+            else:
+                client.thread_resume(
+                    thread_id,
+                    {
+                        "cwd": str(working_directory),
+                        "sandbox": "read-only",
+                    },
+                )
+            prompt = self._plan_prompt(context)
+            started_turn = client.turn_start(
+                thread_id,
+                prompt,
+                {
+                    "model": model_id,
+                    "effort": reasoning_effort,
+                    "sandboxPolicy": {"type": "readOnly"},
+                    "collaborationMode": {
+                        "mode": "plan",
+                        "settings": {
+                            "model": model_id,
+                            "reasoningEffort": reasoning_effort,
+                            "developerInstructions": None,
+                        },
+                    },
+                },
+            )
+            turn_id = started_turn.turn.id
+            self.store.set_setting(f"plan_turn:{run_id}", turn_id)
+            while True:
+                try:
+                    notification = client.next_turn_notification(turn_id)
+                    payload = notification.payload
+                    if notification.method == "item/completed":
+                        item = getattr(payload, "item", None)
+                        changed, completed_plan = _completed_plan_item(item)
+                        file_change_emitted = file_change_emitted or changed
+                        final_plan = completed_plan or final_plan
+                    elif notification.method == "turn/plan/updated":
+                        plan_steps = getattr(payload, "plan", [])
+                        current = next(
+                            (
+                                getattr(step, "step", None)
+                                for step in plan_steps
+                                if _enum_value(getattr(step, "status", None))
+                                == "inProgress"
+                            ),
+                            None,
+                        )
+                        if isinstance(current, str) and current.strip():
+                            await_main(
+                                progress(
+                                    current.strip(),
+                                    {
+                                        "activity_category": "planning",
+                                        "semantic_key": "plan_step",
+                                        "phase": "running",
+                                        "milestone": True,
+                                    },
+                                )
+                            )
+                    elif notification.method == "thread/tokenUsage/updated":
+                        usage = _token_usage_payload(payload)
+                        if usage is not None:
+                            await_main(token_usage(usage))
+                    elif notification.method == "turn/completed":
+                        completed_turn = getattr(payload, "turn", None)
+                        state = _enum_value(getattr(completed_turn, "status", None))
+                        if state == "failed":
+                            error = getattr(completed_turn, "error", None)
+                            raise RuntimeError(
+                                str(
+                                    getattr(error, "message", None)
+                                    or "Codex plan failed"
+                                )
+                            )
+                        break
+                except PlanSuspended:
+                    with suppress(CodexError, OSError, RuntimeError, TimeoutError):
+                        client.turn_interrupt(thread_id, turn_id)
+                    raise
+        if thread_id is None or turn_id is None or final_plan is None:
+            raise RuntimeError("Codex returned no authoritative completed plan item")
+        return {
+            "status": "completed",
+            "markdown": final_plan,
+            "codex_thread_id": thread_id,
+            "codex_turn_id": turn_id,
+            "file_change_items_emitted": file_change_emitted,
+            "effective_model_id": model_id,
+            "effective_reasoning_effort": reasoning_effort,
+        }
+
+    @staticmethod
+    def _plan_prompt(context: dict[str, Any]) -> str:
+        resume_answer = context.get("suspended_question_answer")
+        resume_text = (
+            "\n\nThe following is the exact normalized answer to the previously "
+            f"suspended request:\n{resume_answer}"
+            if isinstance(resume_answer, str) and resume_answer
+            else ""
+        )
+        return (
+            "Produce the authoritative implementation plan for the ordered tasks "
+            "using only the bounded context and this repository. Do not change any "
+            "file. The final response must be a completed plan item."
+            f"{resume_text}\n\n{json.dumps(context, ensure_ascii=False, indent=2)}"
+        )
+
     @staticmethod
     def _prompt(context: dict[str, Any]) -> str:
         return (
@@ -767,6 +999,14 @@ class RuntimeRegistry:
 
     def capabilities(self) -> list[dict[str, str | None]]:
         return [adapter.capability() for adapter in self._adapters.values()]
+
+    def supported_features(self) -> tuple[str, ...]:
+        features: set[str] = set()
+        for adapter in self._adapters.values():
+            provider = getattr(adapter, "supported_features", None)
+            if callable(provider):
+                features.update(provider())
+        return tuple(sorted(features))
 
     async def catalogs(self) -> list[dict[str, Any]]:
         return [await adapter.catalog() for adapter in self._adapters.values()]

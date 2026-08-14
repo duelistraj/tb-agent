@@ -9,12 +9,27 @@ from tether_agent.runtime import (
     RESULT_SCHEMA,
     TokenUsageReporter,
     _child_environment,
+    _completed_plan_item,
     _final_response_from_items,
     _item_activity,
     _parse_result,
     _repository_relative_path,
     _token_usage_payload,
 )
+
+
+def test_completed_plan_item_unwraps_generated_thread_item_root() -> None:
+    changed, markdown = _completed_plan_item(
+        SimpleNamespace(root=SimpleNamespace(type="plan", text="# Plan\n\nDo it."))
+    )
+    file_changed, no_plan = _completed_plan_item(
+        SimpleNamespace(root=SimpleNamespace(type="fileChange"))
+    )
+
+    assert changed is False
+    assert markdown == "# Plan\n\nDo it."
+    assert file_changed is True
+    assert no_plan is None
 
 
 def test_child_environment_excludes_daemon_credentials(

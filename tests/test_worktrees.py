@@ -1,9 +1,19 @@
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
 from tether_agent.config import ProjectMapping, WorktreePolicy
 from tether_agent.worktrees import WorktreeManager
+
+
+def git(repository: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repository), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def test_cleanup_never_removes_dirty_worktree(monkeypatch, tmp_path: Path) -> None:
@@ -87,3 +97,39 @@ def test_worktree_paths_are_distinct_for_each_project(
     assert first_path != second_path
     assert first_path == shared_root / str(first.project_id) / str(run_id)
     assert second_path == shared_root / str(second.project_id) / str(run_id)
+
+
+def test_planning_worktree_is_detached_clean_and_pinned_to_exact_base(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    git(repository, "init")
+    git(repository, "config", "user.name", "Test User")
+    git(repository, "config", "user.email", "test@example.test")
+    (repository / "README.md").write_text("base\n", encoding="utf-8")
+    git(repository, "add", "README.md")
+    git(repository, "commit", "-m", "base")
+    base = git(repository, "rev-parse", "HEAD")
+    (repository / "README.md").write_text("next\n", encoding="utf-8")
+    git(repository, "commit", "-am", "next")
+    mapping = ProjectMapping(
+        project_id=uuid4(),
+        local_path=repository.resolve(),
+        worktree_root=(tmp_path / "worktrees").resolve(),
+    )
+    manager = WorktreeManager(WorktreePolicy())
+    run_id = uuid4()
+
+    worktree = manager.planning_directory(mapping, run_id, base)
+
+    assert git(worktree, "rev-parse", "HEAD") == base
+    branch = subprocess.run(
+        ["git", "-C", str(worktree), "symbolic-ref", "-q", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert branch.returncode == 1
+    assert manager.is_dirty(worktree) is False
+    assert manager.planning_directory(mapping, run_id, base) == worktree

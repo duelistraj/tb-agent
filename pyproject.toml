@@ -1,6 +1,6 @@
 [project]
 name = "tb-agent"
-version = "0.12.0"
+version = "0.13.0"
 description = "Local execution daemon for Tether Brain agent installations"
 readme = "README.md"
 license = "AGPL-3.0-only"

@@ -39,6 +39,39 @@ class WorktreeManager:
         subprocess.run(command, check=True)
         return path
 
+    def planning_directory(
+        self, mapping: ProjectMapping, run_id: UUID, base_commit: str
+    ) -> Path:
+        """Create one detached worktree at the server-captured immutable base."""
+        root = mapping.worktree_root or mapping.local_path.parent / ".tether-worktrees"
+        path = root / str(mapping.project_id) / f"{run_id}-plan"
+        if not path.exists():
+            root.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(mapping.local_path),
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(path),
+                    base_commit,
+                ],
+                check=True,
+            )
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.stdout.strip() != base_commit:
+            raise RuntimeError("Planning worktree does not match the captured base")
+        if self.is_dirty(path):
+            raise RuntimeError("Planning worktree is not clean")
+        return path
+
     def is_dirty(self, path: Path) -> bool:
         result = subprocess.run(
             ["git", "-C", str(path), "status", "--porcelain"],

@@ -16,6 +16,7 @@ class RepositoryInfo:
     root: Path
     remote_name: str | None
     remote_url: str | None
+    default_ref: str | None
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -89,6 +90,40 @@ def _remotes(root: Path) -> dict[str, list[str]]:
         ]
         urls_by_name[name] = list(dict.fromkeys(values))
     return urls_by_name
+
+
+def detect_remote_default_ref(root: Path, remote_name: str | None) -> str | None:
+    """Return one advertised remote HEAD branch without using local guesses."""
+
+    if remote_name is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-remote", "--symref", remote_name, "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    candidates = {
+        match.group("branch")
+        for line in result.stdout.splitlines()
+        if (match := re.fullmatch(r"ref:\s+refs/heads/(?P<branch>[^\s]+)\s+HEAD", line))
+    }
+    if len(candidates) != 1:
+        return None
+    branch = next(iter(candidates))
+    valid = subprocess.run(
+        ["git", "check-ref-format", f"refs/heads/{branch}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return branch if valid.returncode == 0 else None
 
 
 def resolve_remote(
@@ -192,4 +227,5 @@ def inspect_repository(
         root=root,
         remote_name=selected_remote_name,
         remote_url=selected_remote,
+        default_ref=detect_remote_default_ref(root, selected_remote_name),
     )

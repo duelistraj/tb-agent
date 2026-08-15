@@ -20,6 +20,7 @@ from tether_agent import __version__
 from tether_agent.config import ProfileConfig
 from tether_agent.locking import LockUnavailable, ProfileLock
 from tether_agent.paths import ProfilePaths
+from tether_agent.repositories import detect_remote_default_ref
 from tether_agent.runtime import RuntimeRegistry
 from tether_agent.state import CredentialRecord, StateStore
 
@@ -367,7 +368,7 @@ async def _oauth_login_unlocked(
     config: ProfileConfig,
     mode: str = "login",
     intent: str = "reauthorize",
-    repository_hints: list[dict[str, str]] | None = None,
+    repository_hints: list[dict[str, str | None]] | None = None,
     replaces_installation_id: str | None = None,
     replacement_operation_id: str | None = None,
 ) -> dict[str, Any]:
@@ -438,6 +439,9 @@ async def _oauth_login_unlocked(
             {
                 "project_id": str(mapping.project_id),
                 "repository_url": mapping.remote_url,
+                "detected_default_ref": detect_remote_default_ref(
+                    mapping.local_path, mapping.remote_name
+                ),
                 "access": mapping.access,
             }
             for mapping in config.project_mappings
@@ -485,7 +489,7 @@ async def oauth_login(
     config: ProfileConfig,
     mode: str = "login",
     intent: str = "reauthorize",
-    repository_hints: list[dict[str, str]] | None = None,
+    repository_hints: list[dict[str, str | None]] | None = None,
     replaces_installation_id: str | None = None,
     replacement_operation_id: str | None = None,
 ) -> dict[str, Any]:

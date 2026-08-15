@@ -31,8 +31,10 @@ from tether_agent.publication import (
     cleanup_merged_publication,
     publish_github_pull_request,
 )
+from tether_agent.repositories import resolve_remote
 from tether_agent.runtime import PlanSuspended, RuntimeRegistry
 from tether_agent.snapshots import (
+    canonical_common_directory,
     create_snapshot,
     head_commit,
     restore_worktree_tree,
@@ -1143,7 +1145,18 @@ class AgentDaemon:
         if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", ref):
             cls._verify_plan_base(mapping.local_path, ref)
             return ref
-        if mapping.remote_name is None:
+        try:
+            remote_name, _ = resolve_remote(
+                mapping.local_path,
+                remote=mapping.remote_url,
+                remote_name=mapping.remote_name,
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                "The repository has no unambiguous selected Git remote. Re-add the "
+                "workspace mapping with --remote-name and --remote."
+            ) from error
+        if remote_name is None:
             raise RuntimeError(
                 "The repository has no explicitly selected Git remote. Re-add the "
                 "workspace mapping with --remote-name."
@@ -1153,6 +1166,10 @@ class AgentDaemon:
         branch = ref.removeprefix("refs/heads/")
         if not branch:
             raise RuntimeError("The configured default ref is not a valid branch")
+        if branch.startswith(("origin/", "upstream/")):
+            raise RuntimeError(
+                "The configured default branch must not include a Git remote name"
+            )
         valid = subprocess.run(
             ["git", "check-ref-format", f"refs/heads/{branch}"],
             check=False,
@@ -1161,27 +1178,56 @@ class AgentDaemon:
         )
         if valid.returncode != 0:
             raise RuntimeError("The configured default ref is not a valid branch")
-        remote_ref = f"refs/remotes/{mapping.remote_name}/{branch}"
-        result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(mapping.local_path),
-                "rev-parse",
-                "--verify",
-                f"{remote_ref}^{{commit}}",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
+        remote_ref = f"refs/remotes/{remote_name}/{branch}"
+        common_directory = canonical_common_directory(mapping.local_path)
+        lock = ProfileLock(
+            common_directory / "tb-agent" / "repository.lock",
+            label="repository",
         )
+        try:
+            lock.acquire(blocking=True)
+            fetch = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(mapping.local_path),
+                    "fetch",
+                    "--no-tags",
+                    remote_name,
+                    f"+refs/heads/{branch}:{remote_ref}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if fetch.returncode != 0:
+                detail = fetch.stderr.strip() or fetch.stdout.strip()
+                raise RuntimeError(
+                    f"Could not fetch configured default branch {branch!r} from "
+                    f"the selected remote {remote_name!r}: {detail}"
+                )
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(mapping.local_path),
+                    "rev-parse",
+                    "--verify",
+                    f"{remote_ref}^{{commit}}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            lock.release()
         commit = result.stdout.strip()
         if result.returncode != 0 or not re.fullmatch(
             r"[0-9a-f]{40}(?:[0-9a-f]{24})?", commit
         ):
             raise RuntimeError(
                 f"Configured default branch {branch!r} is not available from the "
-                f"selected remote {mapping.remote_name!r}. Fetch it or correct the "
+                f"selected remote {remote_name!r}. Fetch it or correct the "
                 "workspace repository settings."
             )
         return commit

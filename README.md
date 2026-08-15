@@ -127,6 +127,8 @@ tb-agent workspace add \
 ```
 
 For OAuth profiles, the browser matches the normalized Git remote to the accessible logical projects and asks you to choose when more than one workspace uses that remote.
+tb-agent also detects the branch advertised as the selected remote's HEAD, and the browser asks you to confirm or correct it as the exact base for Plan runs.
+An existing configured branch is preserved unless you explicitly change it.
 Workspace access is derived from the confirmed repository instead of being selected independently.
 You can also generate this command from workspace Agent execution settings to include a single-use setup reference that identifies the logical project without exposing a credential.
 The reference expires quickly, is bound to the selected installation and workspace, and is consumed once.

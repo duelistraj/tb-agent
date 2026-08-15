@@ -165,7 +165,10 @@ def test_suspended_plan_resume_uses_exact_server_normalized_answer(
     )
 
 
-def test_plan_base_resolves_only_the_selected_remote_branch(tmp_path: Path) -> None:
+def test_plan_base_resolves_only_the_selected_remote_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     repository = tmp_path / "repository"
     remote = tmp_path / "upstream.git"
     repository.mkdir()
@@ -227,6 +230,10 @@ def test_plan_base_resolves_only_the_selected_remote_branch(tmp_path: Path) -> N
         access="read",
         remote_url=str(remote),
         remote_name="upstream",
+    )
+    monkeypatch.setattr(
+        "tether_agent.daemon.resolve_remote",
+        lambda *_args, **_kwargs: ("upstream", "https://example.test/upstream.git"),
     )
 
     assert (

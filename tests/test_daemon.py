@@ -226,6 +226,7 @@ def test_plan_base_resolves_only_the_selected_remote_branch(tmp_path: Path) -> N
         local_path=repository,
         access="read",
         remote_url=str(remote),
+        remote_name="upstream",
     )
 
     assert (

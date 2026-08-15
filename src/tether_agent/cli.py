@@ -647,6 +647,7 @@ def _initialize_profile(args: argparse.Namespace, paths: ProfilePaths) -> int:
                         [
                             {
                                 "repository_url": deferred_repository.remote_url,
+                                "detected_default_ref": deferred_repository.default_ref,
                                 "access": "write",
                             }
                         ]
@@ -672,6 +673,7 @@ def _initialize_profile(args: argparse.Namespace, paths: ProfilePaths) -> int:
                     local_path=deferred_repository.root,
                     access="write",
                     remote_url=deferred_repository.remote_url,
+                    remote_name=deferred_repository.remote_name,
                 )
                 config = config.model_copy(
                     update={"project_mappings": [resolved_mapping]}
@@ -1138,6 +1140,7 @@ def command_workspace_add(args: argparse.Namespace, paths: ProfilePaths) -> int:
                         repository_hints=[
                             {
                                 "repository_url": repository.remote_url,
+                                "detected_default_ref": repository.default_ref,
                                 "access": args.access,
                             }
                         ],

@@ -564,7 +564,7 @@ def test_oauth_init_resolves_project_from_remote_without_prompting_for_an_id(
 ) -> None:
     set_profile_homes(tmp_path, monkeypatch)
     project_id = uuid4()
-    captured_hints: list[dict[str, str]] = []
+    captured_hints: list[dict[str, str | None]] = []
 
     async def login(**kwargs: object) -> dict:
         hints = kwargs.get("repository_hints")
@@ -610,9 +610,11 @@ def test_oauth_init_resolves_project_from_remote_without_prompting_for_an_id(
     assert result == 0
     assert mapping.project_id == project_id
     assert mapping.local_path == git_repository.resolve()
+    assert mapping.remote_name == "origin"
     assert captured_hints == [
         {
             "repository_url": "ssh://git@github.com/TetherBrain/example",
+            "detected_default_ref": None,
             "access": "write",
         }
     ]
@@ -732,6 +734,7 @@ def test_oauth_workspace_add_resolves_project_without_prompting_for_an_id(
     assert captured["repository_hints"] == [
         {
             "repository_url": "ssh://git@github.com/TetherBrain/example",
+            "detected_default_ref": None,
             "access": "write",
         }
     ]

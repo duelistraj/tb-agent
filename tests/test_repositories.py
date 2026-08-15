@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from tether_agent.repositories import (
+    detect_remote_default_ref,
     git_remote_identity,
     inspect_repository,
     normalize_git_remote,
@@ -92,3 +93,41 @@ def test_missing_and_ambiguous_remotes_require_explicit_choice(
 def test_non_repository_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not a git repository"):
         inspect_repository(tmp_path, allow_no_remote=True)
+
+
+def test_remote_default_ref_uses_the_advertised_remote_head(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    remote = tmp_path / "remote.git"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.email", "test@example.test"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.name", "Test"], check=True
+    )
+    (source / "README.md").write_text("test\n")
+    subprocess.run(["git", "-C", str(source), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "clone", "--bare", str(source), str(remote)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "remote", "add", "upstream", str(remote)], check=True
+    )
+
+    assert detect_remote_default_ref(source, "upstream") == "main"
+
+
+def test_remote_default_ref_does_not_guess_when_remote_head_is_unavailable(
+    git_repository: Path,
+) -> None:
+    assert detect_remote_default_ref(git_repository, "origin") is None
+    assert detect_remote_default_ref(git_repository, None) is None

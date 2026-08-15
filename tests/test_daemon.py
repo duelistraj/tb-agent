@@ -167,6 +167,7 @@ def test_suspended_plan_resume_uses_exact_server_normalized_answer(
 
 def test_plan_base_resolves_only_the_selected_remote_branch(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
+    remote = tmp_path / "upstream.git"
     repository.mkdir()
     subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
     subprocess.run(
@@ -177,12 +178,31 @@ def test_plan_base_resolves_only_the_selected_remote_branch(tmp_path: Path) -> N
         ["git", "-C", str(repository), "config", "user.name", "Test"],
         check=True,
     )
+    subprocess.run(["git", "-C", str(repository), "branch", "-M", "main"], check=True)
     (repository / "README.md").write_text("captured\n")
     subprocess.run(["git", "-C", str(repository), "add", "README.md"], check=True)
     subprocess.run(
         ["git", "-C", str(repository), "commit", "-m", "base"],
         check=True,
         capture_output=True,
+    )
+    stale_commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "clone", "--bare", str(repository), str(remote)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "remote", "add", "upstream", str(remote)],
+        check=True,
+    )
+    (repository / "README.md").write_text("new upstream content\n")
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-am", "upstream"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "push", "upstream", "main"], check=True
     )
     commit = subprocess.run(
         ["git", "-C", str(repository), "rev-parse", "HEAD"],
@@ -197,7 +217,7 @@ def test_plan_base_resolves_only_the_selected_remote_branch(tmp_path: Path) -> N
             str(repository),
             "update-ref",
             "refs/remotes/upstream/main",
-            commit,
+            stale_commit,
         ],
         check=True,
     )
@@ -205,7 +225,7 @@ def test_plan_base_resolves_only_the_selected_remote_branch(tmp_path: Path) -> N
         project_id=uuid4(),
         local_path=repository,
         access="read",
-        remote_name="upstream",
+        remote_url=str(remote),
     )
 
     assert (
@@ -224,7 +244,7 @@ def test_plan_base_rejects_missing_default_ref_or_selected_remote(
 
     with pytest.raises(RuntimeError, match="no configured default ref"):
         AgentDaemon._resolve_plan_base(mapping=mapping, requested_ref=None)
-    with pytest.raises(RuntimeError, match="no explicitly selected Git remote"):
+    with pytest.raises(RuntimeError, match="no unambiguous selected Git remote"):
         AgentDaemon._resolve_plan_base(mapping=mapping, requested_ref="main")
 
 
